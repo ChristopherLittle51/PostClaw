@@ -7,4 +7,4 @@ metadata: { "openclaw": { "requires": { "bins": ["deno"] } } }
 # db-memory-search
 
 To search memories, execute the following command using your shell/exec tool:
-`deno run --allow-net --allow-env {baseDir}/scripts/memory_retrieve.ts "<search_query>"`
+`/home/cl/.deno/bin/deno run --allow-net --allow-env /home/cl/.openclaw/workspace/skills/db-memory-search/script.ts "<search_query>"`

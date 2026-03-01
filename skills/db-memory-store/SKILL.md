@@ -7,4 +7,4 @@ metadata: { "openclaw": { "requires": { "bins": ["deno"] } } }
 # db-memory-store
 
 To store a memory, execute the following command using your shell/exec tool:
-`deno run --allow-net --allow-env {baseDir}/scripts/memory_store.ts "<exact_text_to_store>"`
+`/home/cl/.deno/bin/deno run --allow-net --allow-env /home/cl/.openclaw/workspace/skills/db-memory-store/script.ts "<exact_text_to_store>"`

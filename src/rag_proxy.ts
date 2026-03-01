@@ -1,4 +1,4 @@
-import postgres from "postgres";
+import postgres from "npm:postgres";
 
 const LM_STUDIO_URL = "http://10.51.51.145:1234";
 const DB_URL = "postgres://openclaw:6599@localhost:5432/memorydb";
@@ -26,11 +26,11 @@ async function searchPostgres(query: string): Promise<string | null> {
   const results = await sql`
     WITH vector_search AS (
       SELECT id, content, 1 - (embedding <=> ${JSON.stringify(embedding)}) AS vector_score
-      FROM agent_memory ORDER BY embedding <=> ${JSON.stringify(embedding)} LIMIT 5
+      FROM memory_semantic WHERE agent_id = 'openclaw-proto-1' ORDER BY embedding <=> ${JSON.stringify(embedding)} LIMIT 5
     ),
     text_search AS (
       SELECT id, content, ts_rank(fts_vector, websearch_to_tsquery('english', ${query})) AS text_score
-      FROM agent_memory WHERE fts_vector @@ websearch_to_tsquery('english', ${query})
+      FROM memory_semantic WHERE agent_id = 'openclaw-proto-1' AND fts_vector @@ websearch_to_tsquery('english', ${query})
     )
     SELECT COALESCE(v.content, t.content) as content,
            (COALESCE(v.vector_score, 0) * 0.7) + (COALESCE(t.text_score, 0) * 0.3) AS combined_score

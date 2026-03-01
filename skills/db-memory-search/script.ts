@@ -22,14 +22,15 @@ async function searchMemory(query: string) {
     const results = await sql`
       WITH vector_search AS (
         SELECT id, content, 1 - (embedding <=> ${JSON.stringify(embedding)}) AS vector_score
-        FROM agent_memory
+        FROM memory_semantic
+        WHERE agent_id = 'openclaw-proto-1'
         ORDER BY embedding <=> ${JSON.stringify(embedding)}
         LIMIT 10
       ),
       text_search AS (
         SELECT id, content, ts_rank(fts_vector, websearch_to_tsquery('english', ${query})) AS text_score
-        FROM agent_memory
-        WHERE fts_vector @@ websearch_to_tsquery('english', ${query})
+        FROM memory_semantic
+        WHERE agent_id = 'openclaw-proto-1' AND fts_vector @@ websearch_to_tsquery('english', ${query})
       )
       SELECT 
         COALESCE(v.content, t.content) as content,
