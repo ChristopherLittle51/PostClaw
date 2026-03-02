@@ -1,4 +1,6 @@
 import postgres from "npm:postgres";
+// NEW: Import the payload pruner
+import { prunePayload } from "./payload_pruner.ts"; 
 
 const LM_STUDIO_URL = "http://10.51.51.145:1234";
 const DB_URL = "postgres://openclaw:6599@localhost:5432/memorydb";
@@ -6,6 +8,7 @@ const AGENT_ID = "openclaw-proto-1";
 
 const sql = postgres(DB_URL);
 
+// ... (Keep getEmbedding and searchPostgres exactly the same as before) ...
 async function getEmbedding(text: string): Promise<number[]> {
   const res = await fetch(`${LM_STUDIO_URL}/v1/embeddings`, {
     method: "POST",
@@ -27,7 +30,6 @@ async function searchPostgres(query: string): Promise<string | null> {
   
   try {
     await sql.begin(async (tx: any) => {
-      // Set RLS scope
       await tx`SELECT set_config('app.current_agent_id', ${AGENT_ID}, true)`;
       
       const results = await tx`
@@ -71,8 +73,13 @@ Deno.serve({ port: 8000, hostname: "0.0.0.0" }, async (req) => {
   const url = new URL(req.url);
   
   if (req.method === "POST" && url.pathname.includes("/chat/completions")) {
-    const body = await req.json();
+    let body = await req.json();
     
+    // ====================================================================
+    // NEW: Prune the payload before doing anything else
+    body = prunePayload(body);
+    // ====================================================================
+
     const lastUserIndex = body.messages.findLastIndex((m: any) => m.role === "user");
     
     if (lastUserIndex !== -1) {
@@ -111,19 +118,15 @@ Deno.serve({ port: 8000, hostname: "0.0.0.0" }, async (req) => {
       }
     }
 
-    // ====================================================================
-    // NEW: DEBUG FILE DUMP
-    // ====================================================================
     try {
       await Deno.mkdir("debug_logs", { recursive: true });
       const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
       const logFile = `debug_logs/prompt_dump_${timestamp}.json`;
       await Deno.writeTextFile(logFile, JSON.stringify(body, null, 2));
-      console.log(`[DEBUG] Successfully dumped full prompt payload to: ${logFile}`);
+      console.log(`[DEBUG] Successfully dumped pruned prompt payload to: ${logFile}`);
     } catch (e) {
       console.error("[DEBUG] Failed to write prompt debug log:", e);
     }
-    // ====================================================================
 
     return fetch(`${LM_STUDIO_URL}${url.pathname}`, {
       method: "POST",
