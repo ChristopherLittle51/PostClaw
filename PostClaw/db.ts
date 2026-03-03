@@ -24,10 +24,17 @@ export const sql = postgres(DB_URL);
  * Generate a vector embedding for a given text string via LM Studio.
  */
 export async function getEmbedding(text: string): Promise<number[]> {
+  if (!text || typeof text !== "string" || !text.trim()) {
+    throw new Error(`[EMBED] Refusing to embed empty/undefined text (received: ${JSON.stringify(text)})`);
+  }
+
+  const body = JSON.stringify({ input: text, model: EMBEDDING_MODEL });
+  console.log(`[EMBED] Request body preview: ${body.substring(0, 200)}`);
+
   const res = await fetch(`${LM_STUDIO_URL}/v1/embeddings`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ input: text, model: EMBEDDING_MODEL }),
+    body,
   });
 
   if (!res.ok) {

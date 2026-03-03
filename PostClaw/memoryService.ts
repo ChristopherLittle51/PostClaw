@@ -1,4 +1,4 @@
-import { sql, AGENT_ID, EMBEDDING_MODEL, getEmbedding } from "./db.js";
+import { sql, AGENT_ID, EMBEDDING_MODEL, getEmbedding, hashContent } from "./db.js";
 
 // =============================================================================
 // SEMANTIC SEARCH + GRAPH TRAVERSAL
@@ -221,4 +221,170 @@ export async function fetchDynamicTools(embedding: number[]): Promise<ChatComple
   }
 
   return dynamicTools;
+}
+
+// =============================================================================
+// MEMORY STORE (replaces db-memory-store skill)
+// =============================================================================
+
+/**
+ * Store a new semantic memory fact. Deduplicates via content_hash.
+ */
+export async function storeMemory(
+  content: string,
+  scope: "private" | "shared" | "global" = "private"
+): Promise<{ id: string | null; status: string }> {
+  try {
+    const embedding = await getEmbedding(content);
+    const contentHash = hashContent(content);
+
+    const result = await sql.begin(async (tx: any) => {
+      await tx`SELECT set_config('app.current_agent_id', ${AGENT_ID}, true)`;
+
+      const rows = await tx`
+        INSERT INTO memory_semantic (
+          agent_id, access_scope, content, content_hash, embedding, embedding_model
+        ) VALUES (
+          ${AGENT_ID}, ${scope}, ${content}, ${contentHash},
+          ${JSON.stringify(embedding)}, ${EMBEDDING_MODEL}
+        )
+        ON CONFLICT (agent_id, content_hash) DO NOTHING
+        RETURNING id;
+      `;
+      return rows;
+    });
+
+    if (result.length > 0) {
+      console.log(`[MEMORY] Stored new fact: "${content.substring(0, 60)}..."`);
+      return { id: result[0].id, status: "stored" };
+    } else {
+      console.log(`[MEMORY] Duplicate — fact already exists.`);
+      return { id: null, status: "duplicate" };
+    }
+  } catch (err) {
+    console.error("[MEMORY] Failed to store:", err);
+    return { id: null, status: `error: ${err}` };
+  }
+}
+
+// =============================================================================
+// MEMORY UPDATE (replaces db-memory-update skill)
+// =============================================================================
+
+/**
+ * Supersede an old memory with a corrected/updated fact.
+ * Archives the old memory and creates a new one with a causal link.
+ */
+export async function updateMemory(
+  oldMemoryId: string,
+  newFact: string
+): Promise<{ newId: string | null; status: string }> {
+  try {
+    const embedding = await getEmbedding(newFact);
+    const contentHash = hashContent(newFact);
+
+    const result = await sql.begin(async (tx: any) => {
+      await tx`SELECT set_config('app.current_agent_id', ${AGENT_ID}, true)`;
+
+      // Insert the new truth
+      const newMem = await tx`
+        INSERT INTO memory_semantic (
+          agent_id, access_scope, content, content_hash, embedding, embedding_model
+        ) VALUES (
+          ${AGENT_ID}, 'global', ${newFact}, ${contentHash},
+          ${JSON.stringify(embedding)}, ${EMBEDDING_MODEL}
+        )
+        RETURNING id;
+      `;
+      const newId = newMem[0].id;
+
+      // Deprecate the old memory
+      await tx`
+        UPDATE memory_semantic
+        SET is_archived = true, superseded_by = ${newId}
+        WHERE id = ${oldMemoryId} AND agent_id = ${AGENT_ID};
+      `;
+
+      return newId;
+    });
+
+    console.log(`[MEMORY] Updated. Old (${oldMemoryId.substring(0, 8)}) deprecated, new truth: ${result.substring(0, 8)}`);
+    return { newId: result, status: "updated" };
+  } catch (err) {
+    console.error("[MEMORY] Failed to update:", err);
+    return { newId: null, status: `error: ${err}` };
+  }
+}
+
+// =============================================================================
+// MEMORY LINK (replaces db-memory-link skill)
+// =============================================================================
+
+/**
+ * Create a directed edge between two memories in the knowledge graph.
+ */
+export async function linkMemories(
+  sourceId: string,
+  targetId: string,
+  relationship: string
+): Promise<{ status: string }> {
+  try {
+    await sql.begin(async (tx: any) => {
+      await tx`SELECT set_config('app.current_agent_id', ${AGENT_ID}, true)`;
+
+      await tx`
+        INSERT INTO entity_edges (agent_id, source_memory_id, target_memory_id, relationship_type, weight)
+        VALUES (${AGENT_ID}, ${sourceId}, ${targetId}, ${relationship}, 1.0)
+        ON CONFLICT (source_memory_id, target_memory_id, relationship_type) DO NOTHING;
+      `;
+    });
+
+    console.log(`[GRAPH] Linked ${sourceId.substring(0, 8)} → ${targetId.substring(0, 8)} as "${relationship}"`);
+    return { status: "linked" };
+  } catch (err) {
+    console.error("[GRAPH] Failed to link:", err);
+    return { status: `error: ${err}` };
+  }
+}
+
+// =============================================================================
+// TOOL STORE (replaces db-tool-store skill)
+// =============================================================================
+
+/**
+ * Store or update a tool definition in context_environment.
+ */
+export async function storeTool(
+  toolName: string,
+  toolJson: string,
+  scope: "private" | "shared" | "global" = "private"
+): Promise<{ status: string }> {
+  try {
+    const toolObj = JSON.parse(toolJson);
+    const description = toolObj.function?.description || toolObj.description || "";
+    const embedText = `${toolName}: ${description}`;
+    const embedding = await getEmbedding(embedText);
+
+    await sql.begin(async (tx: any) => {
+      await tx`SELECT set_config('app.current_agent_id', ${AGENT_ID}, true)`;
+
+      await tx`
+        INSERT INTO context_environment (
+          agent_id, access_scope, tool_name, context_data, embedding
+        ) VALUES (
+          ${AGENT_ID}, ${scope}, ${toolName}, ${toolJson}, ${JSON.stringify(embedding)}
+        )
+        ON CONFLICT (agent_id, tool_name) DO UPDATE SET
+          context_data = EXCLUDED.context_data,
+          embedding = EXCLUDED.embedding,
+          access_scope = EXCLUDED.access_scope;
+      `;
+    });
+
+    console.log(`[TOOLS] Stored/updated tool schema: ${toolName}`);
+    return { status: "stored" };
+  } catch (err) {
+    console.error("[TOOLS] Failed to store tool:", err);
+    return { status: `error: ${err}` };
+  }
 }

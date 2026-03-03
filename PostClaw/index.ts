@@ -3,7 +3,7 @@
 // =============================================================================
 
 export { sql, LM_STUDIO_URL, DB_URL, AGENT_ID, EMBEDDING_MODEL, getEmbedding, hashContent } from "./db.js";
-export { searchPostgres, logEpisodicMemory, logEpisodicToolCall, fetchPersonaContext, fetchDynamicTools } from "./memoryService.js";
+export { searchPostgres, logEpisodicMemory, logEpisodicToolCall, fetchPersonaContext, fetchDynamicTools, storeMemory, updateMemory, linkMemories, storeTool } from "./memoryService.js";
 export type { ChatCompletionTool } from "./memoryService.js";
 
 // =============================================================================
@@ -60,7 +60,8 @@ function isDuplicate(key: string): boolean {
 // =============================================================================
 
 import { getEmbedding } from "./db.js";
-import { searchPostgres, logEpisodicMemory, logEpisodicToolCall, fetchPersonaContext, fetchDynamicTools } from "./memoryService.js";
+import { searchPostgres, logEpisodicMemory, logEpisodicToolCall, fetchPersonaContext, fetchDynamicTools, storeMemory, updateMemory, linkMemories, storeTool } from "./memoryService.js";
+import { Type } from "@sinclair/typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -130,23 +131,16 @@ const openclawPostgresPlugin = {
       "before_prompt_build",
       async (event: any, ctx: any) => {
         try {
-          // --- DEBUG: dump incoming event ---
-          // debugLog("before_prompt_build", "IN", {
-          //   hasPrompt: typeof event.prompt === "string",
-          //   promptLength: event.prompt?.length ?? 0,
-          //   promptPreview: event.prompt?.substring(0, 500) ?? null,
-          //   messageCount: event.messages?.length ?? 0,
-          //   messageRoles: (event.messages ?? []).map((m: any) => m.role),
-          //   ctx,
-          //   eventKeys: Object.keys(event),
-          // });
-
           const messages: ChatMessage[] = event.messages ?? [];
           const userText = lastReceivedMessage || extractUserText(messages);
+          lastReceivedMessage = "";  // consume once — prevent stale leak into heartbeats
           const cleanText = userText.replace(/^\[.*?\]\s*/, "");
-          const isHeartbeat = cleanText.toLowerCase().includes("heartbeat") || cleanText.toLowerCase().includes("cron");
 
-          console.log(`[PostClaw] before_prompt_build: "${cleanText.substring(0, 80)}..." (heartbeat=${isHeartbeat})`);
+          // Detect heartbeat via ctx metadata (preferred) with keyword fallback
+          const provider = ctx?.messageProvider ?? "";
+          const isHeartbeat = provider === "heartbeat" || provider === "cron";
+
+          console.log(`[PostClaw] before_prompt_build: "${cleanText.substring(0, 80)}..." (heartbeat=${isHeartbeat}, provider=${provider})`);
 
           // ==================================================================
           // STEP 1: Prune the system prompt (strip OpenClaw default bloat)
@@ -180,13 +174,14 @@ const openclawPostgresPlugin = {
             You are a stateful agent. Your context window is ephemeral but your PostgreSQL memory is permanent.
             Silently manage your knowledge — never ask permission to save, link, or update facts.
 
-            - **Retrieval:** Relevant memories (with UUID tags) are auto-injected. If a relevant memory is not in the user message, perform a search for it.
-            - **Search:** Use when a relevant memory is not in the user message. \`deno run -A /home/cl/.openclaw/workspace/skills/db-memory-search/script.ts "${agentId}" "<query>"\`
-            - **Correct/update facts:** Use when a fact is incorrect, outdated, or needs to be updated. \`deno run -A /home/cl/.openclaw/workspace/skills/db-memory-update/script.ts "<old_id>" "<new_fact>"\`
-            - **Save new facts:** Use when a new fact is learned. \`deno run -A /home/cl/.openclaw/workspace/skills/db-memory-store/script.ts "${agentId}" "global" "<fact>"\`
-            - **Link related memories:** Use when two memories are related. \`deno run -A /home/cl/.openclaw/workspace/skills/db-memory-link/script.ts "<source_id>" "<target_id>" "<relationship>"\`
-            - **Store a tool:** Use when a new tool is learned. \`deno run -A /home/cl/.openclaw/workspace/skills/db-tool-store/script.ts "${agentId}" "<private|global>" "<name>" "<json>"\`
+            - **Retrieval:** Relevant memories (with UUID tags) are auto-injected.
+            - **Search:** Use the \`memory_search\` tool when you need to recall facts not in the current context.
+            - **Correct/update facts:** Use the \`memory_update\` tool when a fact is incorrect, outdated, or needs to be updated.
+            - **Save new facts:** Use the \`memory_store\` tool when a new fact is learned.
+            - **Link related memories:** Use the \`memory_link\` tool when two memories are related.
+            - **Store a tool:** Use the \`tool_store\` tool when a new tool schema is learned.
             - **Sleep cycle** (consolidates short-term memory): \`deno run -A /home/cl/.openclaw/workspace/scripts/sleep_cycle.ts "${agentId}"\`
+            - **Always Reply**: ALWAYS conclude your turn with a direct response to the user.
             `;
 
           sysPrompt += `
@@ -257,23 +252,96 @@ const openclawPostgresPlugin = {
     );
 
     // -------------------------------------------------------------------------
-    // JIT Dynamic Tools — registered via api.registerTool()
+    // NATIVE TOOLS — Registered via api.registerTool()
     //
-    // Unlike before_prompt_build, tools are registered with a factory function
-    // that resolves dynamically per agent invocation.
+    // These replace the old Deno skill scripts with in-process tool handlers
+    // that share the plugin's DB connection pool and embedding infrastructure.
     // -------------------------------------------------------------------------
+
+    // --- memory_search: Semantic search across stored memories ---
     api.registerTool(
-      (toolCtx: any) => {
-        // This factory runs each time the agent needs tools.
-        // We can't do async here, so we return a wrapper tool that does the
-        // actual dynamic lookup. The dynamic tools table holds tool definitions
-        // that get injected when semantically relevant.
-        //
-        // For now, return null — dynamic tool injection will be handled
-        // via prependContext instructions to the model.
-        return null;
+      {
+        name: "memory_search",
+        description: "Search the agent's long-term semantic memory using natural language. Returns the most relevant stored facts and their UUIDs.",
+        parameters: Type.Object({
+          query: Type.String({ description: "Natural language search query" }),
+        }),
+        async execute(_id: string, args: { query: string }) {
+          const result = await searchPostgres(args.query);
+          return result || "No memories found matching that query.";
+        },
       },
-      { names: [] },
+      { names: ["memory_search"] },
+    );
+
+    // --- memory_store: Save a new durable fact ---
+    api.registerTool(
+      {
+        name: "memory_store",
+        description: "Store a new durable fact in long-term semantic memory. Automatically deduplicates via content hash.",
+        parameters: Type.Object({
+          content: Type.String({ description: "The fact or knowledge to store" }),
+          scope: Type.Optional(Type.Union([Type.Literal("private"), Type.Literal("shared"), Type.Literal("global")], { description: "Visibility scope. Default: private", default: "private" })),
+        }),
+        async execute(_id: string, args: { content: string; scope?: "private" | "shared" | "global" }) {
+          const result = await storeMemory(args.content, args.scope);
+          return JSON.stringify(result);
+        },
+      },
+      { names: ["memory_store"] },
+    );
+
+    // --- memory_update: Supersede an old fact with a corrected one ---
+    api.registerTool(
+      {
+        name: "memory_update",
+        description: "Correct or update an existing memory. Archives the old fact and creates a new one with a causal chain link.",
+        parameters: Type.Object({
+          old_memory_id: Type.String({ description: "UUID of the outdated memory to supersede" }),
+          new_fact: Type.String({ description: "The corrected or updated fact" }),
+        }),
+        async execute(_id: string, args: { old_memory_id: string; new_fact: string }) {
+          const result = await updateMemory(args.old_memory_id, args.new_fact);
+          return JSON.stringify(result);
+        },
+      },
+      { names: ["memory_update"] },
+    );
+
+    // --- memory_link: Create a knowledge graph edge between two memories ---
+    api.registerTool(
+      {
+        name: "memory_link",
+        description: "Create a directed relationship edge between two memories in the knowledge graph.",
+        parameters: Type.Object({
+          source_id: Type.String({ description: "UUID of the source memory" }),
+          target_id: Type.String({ description: "UUID of the target memory" }),
+          relationship: Type.String({ description: "Relationship type (e.g. related_to, elaborates, contradicts, depends_on, part_of)" }),
+        }),
+        async execute(_id: string, args: { source_id: string; target_id: string; relationship: string }) {
+          const result = await linkMemories(args.source_id, args.target_id, args.relationship);
+          return JSON.stringify(result);
+        },
+      },
+      { names: ["memory_link"] },
+    );
+
+    // --- tool_store: Store or update a tool schema definition ---
+    api.registerTool(
+      {
+        name: "tool_store",
+        description: "Store or update a tool definition in the environment context database, so it can be dynamically loaded for future conversations.",
+        parameters: Type.Object({
+          tool_name: Type.String({ description: "Unique name for the tool" }),
+          tool_json: Type.String({ description: "Full JSON schema definition of the tool" }),
+          scope: Type.Optional(Type.Union([Type.Literal("private"), Type.Literal("shared"), Type.Literal("global")], { description: "Visibility scope. Default: private", default: "private" })),
+        }),
+        async execute(_id: string, args: { tool_name: string; tool_json: string; scope?: "private" | "shared" | "global" }) {
+          const result = await storeTool(args.tool_name, args.tool_json, args.scope);
+          return JSON.stringify(result);
+        },
+      },
+      { names: ["tool_store"] },
     );
 
     // -------------------------------------------------------------------------
@@ -287,19 +355,16 @@ const openclawPostgresPlugin = {
       "agent_end",
       async (event: any, ctx: any) => {
         try {
-          // --- DEBUG: dump incoming event ---
-          // debugLog("agent_end", "IN", {
-          //   eventKeys: Object.keys(event),
-          //   messageCount: event.messages?.length ?? 0,
-          //   messageRoles: (event.messages ?? []).map((m: any) => m.role),
-          //   success: event.success,
-          //   error: event.error,
-          //   durationMs: event.durationMs,
-          //   ctx,
-          // });
-
           const messages: ChatMessage[] = event.messages ?? [];
-          console.log(`[PostClaw] agent_end: ${messages.length} messages, success=${event.success}`);
+          const provider = ctx?.messageProvider ?? "";
+          const isHeartbeat = provider === "heartbeat" || provider === "cron";
+          console.log(`[PostClaw] agent_end: ${messages.length} messages, success=${event.success}, provider=${provider}`);
+
+          // Skip all episodic logging for heartbeat/cron runs
+          if (isHeartbeat) {
+            console.log("[PostClaw] Skipped episodic logging for heartbeat run");
+            return;
+          }
 
           // Extract the last user message
           const lastUser = [...messages].reverse().find((m: ChatMessage) => m.role === "user");
