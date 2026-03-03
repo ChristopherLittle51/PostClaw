@@ -8,7 +8,8 @@ const AGENT_ID = "openclaw-proto-1";
 
 const sql = postgres(DB_URL);
 
-// ... (Keep getEmbedding and searchPostgres exactly the same as before) ...
+const processedEvents = new Set<string>();
+
 async function getEmbedding(text: string): Promise<number[]> {
   const res = await fetch(`${LM_STUDIO_URL}/v1/embeddings`, {
     method: "POST",
@@ -109,6 +110,101 @@ async function fetchPersonaContext(embedding: number[]): Promise<string | null> 
   return personaContext;
 }
 
+async function fetchDynamicTools(embedding: number[]): Promise<any[]> {
+  let dynamicTools: any[] = [];
+  try {
+    await sql.begin(async (tx: any) => {
+      await tx`SELECT set_config('app.current_agent_id', ${AGENT_ID}, true)`;
+      
+      // Lowered the threshold from 0.50 to 0.35
+      const results = await tx`
+        SELECT tool_name, context_data, 1 - (embedding <=> ${JSON.stringify(embedding)}) AS similarity
+        FROM context_environment
+        WHERE 1 - (embedding <=> ${JSON.stringify(embedding)}) > 0.35
+        ORDER BY similarity DESC
+        LIMIT 3;
+      `;
+      
+      if (results.length > 0) {
+        dynamicTools = results.map((r: any) => JSON.parse(r.context_data));
+        console.log(`\n[DEBUG] 🔧 Dynamically loaded tools from DB: ${results.map((r: any) => r.tool_name).join(', ')}`);
+      }
+    });
+  } catch (err) {
+    console.error("[DEBUG] Failed to fetch dynamic tools:", err);
+  }
+  return dynamicTools;
+}
+
+async function logEpisodicMemory(text: string, embedding: number[], eventType: string = 'user_prompt') {
+  // 1. In-Memory Debounce Check
+  if (processedEvents.has(text)) return;
+  
+  // 2. Add to cache and prevent memory leaks by capping size
+  processedEvents.add(text);
+  if (processedEvents.size > 1000) processedEvents.clear();
+
+  try {
+    await sql.begin(async (tx: any) => {
+      await tx`SELECT set_config('app.current_agent_id', ${AGENT_ID}, true)`;
+      
+      await tx`
+        INSERT INTO memory_episodic (
+          agent_id, session_id, event_summary, event_type, embedding, embedding_model
+        ) VALUES (
+          ${AGENT_ID}, 'active-session', ${text}, ${eventType}, ${JSON.stringify(embedding)}, 'nomic-embed-text-v2-moe'
+        )
+      `;
+    });
+    console.log(`\n[OBSERVER] 📝 Logged episodic event (${eventType}) to database.`);
+  } catch (err) {
+    console.error("[OBSERVER] Failed to log episodic memory:", err);
+  }
+}
+
+async function logEpisodicToolCalls(messages: any[]) {
+  try {
+    const lastAssistantIndex = messages.findLastIndex((m: any) => 
+      m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0
+    );
+    
+    if (lastAssistantIndex !== -1) {
+      const assistantMessage = messages[lastAssistantIndex];
+      
+      for (const toolCall of assistantMessage.tool_calls) {
+        const toolCallId = toolCall.id || `fallback-${toolCall.function.name}-${toolCall.function.arguments.substring(0, 20)}`;
+        
+        // 1. In-Memory Debounce Check
+        if (processedEvents.has(toolCallId)) continue;
+        
+        // 2. Add to cache
+        processedEvents.add(toolCallId);
+        
+        const toolName = toolCall.function.name;
+        const toolArgs = toolCall.function.arguments;
+        const summary = `Agent executed tool: ${toolName} with arguments: ${toolArgs}`;
+        
+        // Only generate the embedding IF it passes the cache check
+        const embedding = await getEmbedding(summary);
+        
+        await sql.begin(async (tx: any) => {
+          await tx`SELECT set_config('app.current_agent_id', ${AGENT_ID}, true)`;
+          await tx`
+            INSERT INTO memory_episodic (
+              agent_id, session_id, event_summary, event_type, embedding, embedding_model, metadata
+            ) VALUES (
+              ${AGENT_ID}, 'active-session', ${summary}, 'tool_execution', ${JSON.stringify(embedding)}, 'nomic-embed-text-v2-moe', ${JSON.stringify({ tool_call_id: toolCallId, tool_name: toolName })}
+            )
+          `;
+        });
+        console.log(`\n[OBSERVER] 🛠️  Logged tool execution (${toolName}) to database.`);
+      }
+    }
+  } catch (err) {
+    console.error("[OBSERVER] Failed to log episodic tool calls:", err);
+  }
+}
+
 Deno.serve({ port: 8000, hostname: "0.0.0.0" }, async (req) => {
   const url = new URL(req.url);
   
@@ -139,13 +235,31 @@ Deno.serve({ port: 8000, hostname: "0.0.0.0" }, async (req) => {
         console.log(`\n==================================================`);
         console.log(`[REQUEST] Intercepted user message: "${userText}"`);
         
-        // 1. Generate the embedding ONCE for both searches
-        const embedding = await getEmbedding(userText);
+        // Strip the [Day YYYY-MM-DD HH:MM UTC] prefix for a purer semantic vector
+        const cleanText = userText.replace(/^\[.*?\]\s*/, "");
         
-        // 2. Fetch Memories and Persona concurrently to save time
-        const [memoryContext, personaContext] = await Promise.all([
-          searchPostgres(userText), // Uses the text for hybrid FTS search
-          fetchPersonaContext(embedding) // Uses the vector for persona search
+        // 1. Generate the embedding using the CLEAN text
+        const embedding = await getEmbedding(cleanText);
+        
+        // ====================================================================
+        // NEW: SILENT OBSERVER
+        // ====================================================================
+        const isHeartbeat = userText.toLowerCase().includes("heartbeat") || userText.toLowerCase().includes("cron");
+        
+        if (!isHeartbeat) {
+          // Fire-and-forget logging for the User's prompt
+          logEpisodicMemory(userText, embedding, "user_prompt");
+        }
+
+        // Fire-and-forget scanning for the Assistant's recent tool calls
+        logEpisodicToolCalls(body.messages);
+        // ====================================================================
+        
+        // 2. Fetch Memories, Persona, and Tools concurrently
+        const [memoryContext, personaContext, dynamicTools] = await Promise.all([
+          searchPostgres(userText), 
+          fetchPersonaContext(embedding),
+          fetchDynamicTools(embedding) // NEW
         ]);
         
         // 3. Inject Situational Memories into the User Message
@@ -168,6 +282,11 @@ Deno.serve({ port: 8000, hostname: "0.0.0.0" }, async (req) => {
              const identityString = `\n\n## Dynamic Database Persona\nThe following core operational rules were loaded from your database:\n${personaContext}\n`;
              body.messages[systemIndex].content += identityString;
           }
+        }
+
+        // NEW: Inject Dynamic Tools
+        if (dynamicTools.length > 0 && body.tools) {
+           body.tools.push(...dynamicTools);
         }
       }
     }

@@ -65,33 +65,46 @@ export function prunePayload(body: any): any {
       `;
     sysPrompt += denoLocation;
 
+    const sleepCycle = `
+      ## Sleep Cycle
+      You are equipped with a sleep cycle that consolidates your short-term memory into durable facts.
+      When you receive a user prompt, you should proactively run the sleep cycle to extract durable facts.
+      
+      To run the sleep cycle, use your \`exec\` tool to run this exact command:
+      deno run --allow-net --allow-env /home/cl/.openclaw/workspace/scripts/sleep_cycle.ts "${agentId}"
+      `;
+    sysPrompt += sleepCycle;
+
+    const heartbeats = `
+      ## Autonomous Heartbeats
+      OpenClaw provides a native background heartbeat loop. NEVER use Linux crontab.
+      To schedule future work or background tasks, use your file tools to add a checklist to: /home/cl/.openclaw/workspace/HEARTBEAT.md
+      When you receive a heartbeat poll, read that file. If you have no pending tasks, reply with ONLY: HEARTBEAT_OK
+      `;
+    sysPrompt += heartbeats;
+
+    const toolStore = `
+      ## Tool Store
+      You are equipped with a tool store that allows you to store and retrieve tools for later use.
+      To store a tool, use your \`exec\` tool to run this exact command:
+      deno run --allow-net --allow-env /home/cl/.openclaw/workspace/skills/db-tool-store/script.ts "${agentId}" "<private|global>" "<tool_name>" "<tool_json>"
+      `;
+    sysPrompt += toolStore;
+
     body.messages[systemIndex].content = sysPrompt;
   } 
 
   // ====================================================================
-  // 2. JIT TOOL FILTERING
+  // 2. STRIP ALL NON-CORE TOOLS (Proxy will dynamically re-inject them)
   // ====================================================================
   if (body.tools && Array.isArray(body.tools)) {
     const coreTools = ["read", "write", "edit", "exec", "process", "session_status"];
-    const activeTools = [...coreTools];
-
-    if (userText.includes("search") || userText.includes("web") || userText.includes("google")) {
-      activeTools.push("web_search", "web_fetch");
-    }
-    if (userText.includes("browser") || userText.includes("chrome") || userText.includes("navigate")) {
-      activeTools.push("browser");
-    }
-    if (userText.includes("message") || userText.includes("discord") || userText.includes("telegram")) {
-      activeTools.push("message", "sessions_send", "sessions_list");
-    }
-    if (userText.includes("canvas") || userText.includes("draw")) {
-      activeTools.push("canvas");
-    }
-
     const originalToolCount = body.tools.length;
-    body.tools = body.tools.filter((t: any) => activeTools.includes(t.function.name));
     
-    console.log(`[PRUNER] Reduced tool schema from ${originalToolCount} to ${body.tools.length} tools.`);
+    // Nuke everything except the core toolkit
+    body.tools = body.tools.filter((t: any) => coreTools.includes(t.function.name));
+    
+    console.log(`[PRUNER] Stripped tools from ${originalToolCount} down to ${body.tools.length} core tools.`);
   }
 
   return body;
