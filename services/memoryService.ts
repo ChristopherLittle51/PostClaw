@@ -67,7 +67,7 @@ export async function searchPostgres(
           LIMIT ${semanticLimit}
         ),
         linked_matches AS (
-          SELECT m.id, m.content, ${linkedSimilarity} AS similarity, e.relationship_type, sm.id AS source_match_id
+          SELECT m.id, m.content, ${linkedSimilarity}::float8 AS similarity, e.relationship_type, sm.id AS source_match_id
           FROM entity_edges e
           JOIN memory_semantic m ON (e.target_memory_id = m.id OR e.source_memory_id = m.id)
           JOIN semantic_matches sm ON (e.source_memory_id = sm.id OR e.target_memory_id = sm.id)
