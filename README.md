@@ -59,13 +59,20 @@
 ## Quick Start
 
 ```bash
+# PREREQUISITES
+## You must have a password assigned to your postgres user if you are running openclaw from another user.
+sudo -u postgres psql -c "ALTER USER postgres WITH PASSWORD 'YOUR_PASSWORD';"
+
+## Install pgvector plugin (change xx to your postgres version:
+sudo apt install postgresql-16-pgvector  # Ubuntu/Debian example.
+
 # 1. Install the plugin
 openclaw plugins install @christopherlittle51/postclaw  # from npm
 # OR from a local path:
 openclaw plugins install /path/to/PostClaw
 
 # 2. Set up the database (creates DB, user, schema, everything)
-openclaw postclaw setup
+openclaw postclaw setup --admin-url postgres://<POSTGRES-USERNAME>:<PASSWORD>@[IP ADDRESS/localhost]/postgres
 
 # 3. Restart the gateway
 openclaw restart
