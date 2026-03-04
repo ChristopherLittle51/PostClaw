@@ -35,7 +35,6 @@
 | **Knowledge Graph** | Links related memories with typed, directed edges for graph-augmented retrieval |
 | **Dynamic Persona Injection** | Injects agent-specific persona rules and RAG context into every prompt |
 | **Duplicate Detection** | Identifies and merges near-duplicate memories during background maintenance |
-| **Dynamic Tool Loading** | Fetches relevant tool schemas from the database based on conversation context |
 | **Multi-Agent Isolation** | Row-Level Security (RLS) ensures agents can only read/write their own data |
 | **Autonomous Management** | Agents silently store, update, link, and search memories without user prompts |
 
