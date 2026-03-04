@@ -58,7 +58,7 @@
            "memorySearch": {
                 "provider": "openai",
                 "remote": {
-                  "baseUrl": "http://<IP-ADDRESS>:<PORT>/v1",
+                  "baseUrl": "http://<OPENAI-COMPATIBLE-ENDPOINT>/v1",
                   "apiKey": "<API-KEY>"
                 },
                 "model": "text-embedding-nomic-embed-text-v2-moe"
