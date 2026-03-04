@@ -31,7 +31,7 @@ export type { ChatMessage, ContentPart, ToolCallRecord } from "./schemas/validat
 // =============================================================================
 
 const processedEvents = new Set<string>();
-import { registerWorkspaceRoutes } from "./dashboard/routes/workspace.js";
+
 import { getCurrentConfig, loadConfig } from "./services/config.js";
 
 function isDuplicate(key: string): boolean {
@@ -247,7 +247,7 @@ const openclawPostgresPlugin = {
         }),
         async execute(_toolCallId: string, args: { query: string }, _signal: unknown, _onUpdate: unknown, ctx: { agentId?: string; workspaceDir?: string }) {
           const agentId = ctx?.agentId || "main";
-          await ensureAgent(agentId, ctx.workspaceDir);
+          await ensureAgent(agentId, ctx?.workspaceDir);
           const config = getCurrentConfig();
           const result = await searchPostgres(agentId, args.query, {
             semanticLimit: config.rag.semanticLimit,
@@ -275,7 +275,7 @@ const openclawPostgresPlugin = {
         }),
         async execute(_toolCallId: string, args: MemoryStoreArgs, _signal: unknown, _onUpdate: unknown, ctx: { agentId?: string; workspaceDir?: string }) {
           const agentId = ctx?.agentId || "main";
-          await ensureAgent(agentId, ctx.workspaceDir);
+          await ensureAgent(agentId, ctx?.workspaceDir);
           const { content, scope, ...options } = args;
           const result = await storeMemory(agentId, content, scope, options);
           return JSON.stringify(result);
@@ -299,7 +299,7 @@ const openclawPostgresPlugin = {
         }),
         async execute(_toolCallId: string, args: MemoryUpdateArgs, _signal: unknown, _onUpdate: unknown, ctx: { agentId?: string; workspaceDir?: string }) {
           const agentId = ctx?.agentId || "main";
-          await ensureAgent(agentId, ctx.workspaceDir);
+          await ensureAgent(agentId, ctx?.workspaceDir);
           const { old_memory_id, new_fact, ...options } = args;
           const result = await updateMemory(agentId, old_memory_id, new_fact, options);
           return JSON.stringify(result);
@@ -320,7 +320,7 @@ const openclawPostgresPlugin = {
         }),
         async execute(_toolCallId: string, args: { source_id: string; target_id: string; relationship: string }, _signal: unknown, _onUpdate: unknown, ctx: { agentId?: string; workspaceDir?: string }) {
           const agentId = ctx?.agentId || "main";
-          await ensureAgent(agentId, ctx.workspaceDir);
+          await ensureAgent(agentId, ctx?.workspaceDir);
           const result = await linkMemories(agentId, args.source_id, args.target_id, args.relationship);
           return JSON.stringify(result);
         },
@@ -336,7 +336,7 @@ const openclawPostgresPlugin = {
         parameters: Type.Object({}),
         async execute(_toolCallId: string, _args: Record<string, never>, _signal: unknown, _onUpdate: unknown, ctx: { agentId?: string; workspaceDir?: string }) {
           const agentId = ctx?.agentId || "main";
-          await ensureAgent(agentId, ctx.workspaceDir);
+          await ensureAgent(agentId, ctx?.workspaceDir);
           const personas = await listPersonas(agentId);
           return JSON.stringify(personas);
         },
@@ -354,7 +354,7 @@ const openclawPostgresPlugin = {
         }),
         async execute(_toolCallId: string, args: { persona_id: string }, _signal: unknown, _onUpdate: unknown, ctx: { agentId?: string; workspaceDir?: string }) {
           const agentId = ctx?.agentId || "main";
-          await ensureAgent(agentId, ctx.workspaceDir);
+          await ensureAgent(agentId, ctx?.workspaceDir);
           const persona = await getPersona(agentId, args.persona_id);
           return persona ? JSON.stringify(persona) : "Persona not found.";
         },
@@ -375,7 +375,7 @@ const openclawPostgresPlugin = {
         }),
         async execute(_toolCallId: string, args: { persona_id: string; category?: string; content?: string; is_always_active?: boolean }, _signal: unknown, _onUpdate: unknown, ctx: { agentId?: string; workspaceDir?: string }) {
           const agentId = ctx?.agentId || "main";
-          await ensureAgent(agentId, ctx.workspaceDir);
+          await ensureAgent(agentId, ctx?.workspaceDir);
           const { persona_id, ...updates } = args;
           const result = await updatePersona(agentId, persona_id, updates);
           return result ? JSON.stringify(result) : "Persona not found.";
@@ -394,7 +394,7 @@ const openclawPostgresPlugin = {
         }),
         async execute(_toolCallId: string, args: { persona_id: string }, _signal: unknown, _onUpdate: unknown, ctx: { agentId?: string; workspaceDir?: string }) {
           const agentId = ctx?.agentId || "main";
-          await ensureAgent(agentId, ctx.workspaceDir);
+          await ensureAgent(agentId, ctx?.workspaceDir);
           const deleted = await deletePersona(agentId, args.persona_id);
           return deleted ? '{"status": "deleted"}' : "Persona not found.";
         },
@@ -673,8 +673,6 @@ const openclawPostgresPlugin = {
           port: pluginConfig?.dashboardPort,
           bindAddress: pluginConfig?.dashboardBindAddress,
         });
-        // Build router and register all routes
-        registerWorkspaceRoutes(api.router);
       }).catch((err) => {
         console.error("[PostClaw] Failed to start dashboard:", err);
       });
