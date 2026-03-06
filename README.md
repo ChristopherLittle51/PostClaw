@@ -74,7 +74,7 @@ openclaw postclaw setup --admin-url postgres://<admin_user>:<password>@localhost
 Restart your OpenClaw instance to initialize the background sleep cycle timers and connect to the new database.
 
 ```bash
-openclaw restart
+openclaw gateway restart
 ```
 
 ---
