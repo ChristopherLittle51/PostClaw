@@ -59,6 +59,31 @@ const DEFAULT_INTERVAL_HOURS = 6;
 // TYPES
 // =============================================================================
 
+/**
+ * Defensively extracts a JSON object from raw LLM output.
+ * Handles markdown fences (```json ... ```) or conversational filler 
+ * wrapping the actual { ... } block.
+ */
+function extractJsonFromLlmOutput(text: string): string {
+  if (!text) return "";
+
+  // 1. Try to find a fenced code block
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (fenceMatch && fenceMatch[1]) {
+    return fenceMatch[1].trim();
+  }
+
+  // 2. Try to find the outermost curly braces
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    return text.substring(firstBrace, lastBrace + 1).trim();
+  }
+
+  // 3. Fallback to just returning the trimmed string and letting JSON.parse try
+  return text.trim();
+}
+
 // SleepCycleResult and LinkClassification types are now imported from schemas
 
 export interface SleepCycleOptions {
@@ -143,7 +168,20 @@ Do not use markdown formatting.
 `;
 
   const jsonString = await callLLMviaAgent(`${systemPrompt}\n\nHere is the recent episodic transcript to analyze:\n\n${transcript}`, agentId);
-  const result: SleepCycleResult = SleepCycleResultSchema.parse(JSON.parse(jsonString));
+  
+  let result: SleepCycleResult;
+  try {
+    const cleanString = extractJsonFromLlmOutput(jsonString);
+    result = SleepCycleResultSchema.parse(JSON.parse(cleanString));
+  } catch (err: any) {
+    console.error(`\n[PHASE 1] ❌ FATAL PARSE ERROR`);
+    console.error(`The internal LLM response could not be parsed as valid JSON.`);
+    console.error(`This blocks the promotion of short-term memories into semantic facts.\n`);
+    console.error(`=== RAW LLM OUTPUT ===`);
+    console.error(jsonString);
+    console.error(`======================\n`);
+    throw new Error(`Episodic consolidation parsing failed: ${err.message}`);
+  }
 
   console.log(`[PHASE 1] Extracted ${result.extracted_durable_facts.length} permanent facts.`);
   console.log(`[PHASE 1] Session Summary: ${result.session_summary}`);
@@ -508,9 +546,12 @@ Do not use markdown formatting.
 
     let classifications: LinkClassification[];
     try {
-      classifications = z.array(LinkClassificationSchema).parse(JSON.parse(jsonString));
-    } catch {
-      console.error(`[PHASE 4] Failed to parse LLM response for batch ${Math.floor(i / options.batchSize) + 1}. Skipping.`);
+      const cleanString = extractJsonFromLlmOutput(jsonString);
+      classifications = z.array(LinkClassificationSchema).parse(JSON.parse(cleanString));
+    } catch (err: any) {
+      console.error(`\n[PHASE 4] ⚠️ Parsing skipped for batch ${Math.floor(i / options.batchSize) + 1}.`);
+      console.error(`[PHASE 4] LLM response could not be parsed as a valid JSON array of relationships.`);
+      console.error(`[PHASE 4] Raw LLM Output:\n${jsonString}\n`);
       continue;
     }
 
