@@ -73,11 +73,23 @@ function extractJsonFromLlmOutput(text: string): string {
     return fenceMatch[1].trim();
   }
 
-  // 2. Try to find the outermost curly braces
+  // 2. Try to find the outermost curly braces or square brackets
   const firstBrace = text.indexOf("{");
   const lastBrace = text.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    return text.substring(firstBrace, lastBrace + 1).trim();
+  const firstBracket = text.indexOf("[");
+  const lastBracket = text.lastIndexOf("]");
+  
+  const firstIdx = Math.min(
+    firstBrace === -1 ? Infinity : firstBrace,
+    firstBracket === -1 ? Infinity : firstBracket
+  );
+  
+  if (firstIdx !== Infinity) {
+    const isArray = firstIdx === firstBracket;
+    const lastIdx = isArray ? lastBracket : lastBrace;
+    if (lastIdx !== -1 && lastIdx > firstIdx) {
+      return text.substring(firstIdx, lastIdx + 1).trim();
+    }
   }
 
   // 3. Fallback to just returning the trimmed string and letting JSON.parse try
