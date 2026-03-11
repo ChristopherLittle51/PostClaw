@@ -52,6 +52,10 @@ const DEFAULT_LINK_CANDIDATES_PER_MEMORY = 5;
 const DEFAULT_LINK_BATCH_SIZE = 20;
 const DEFAULT_LINK_SCAN_LIMIT = 50;
 
+// Content size management — prevents E2BIG (ARG_MAX) errors and LLM context overflow
+const SUMMARIZE_CHUNK_SIZE = 30_000;     // chars per LLM summarization chunk (~7.5K tokens)
+const PROMPT_CONTENT_MAX_CHARS = 2_000;  // max chars per content item in final prompts
+
 // Background service
 const DEFAULT_INTERVAL_HOURS = 6;
 
@@ -94,6 +98,72 @@ function extractJsonFromLlmOutput(text: string): string {
 
   // 3. Fallback to just returning the trimmed string and letting JSON.parse try
   return text.trim();
+}
+
+/**
+ * Truncate text to maxChars with a suffix indicating truncation.
+ * Used for Phase 4 pair descriptions where an LLM call isn't worth the cost.
+ */
+function truncateForPrompt(text: string, maxChars: number): string {
+  if (!text || text.length <= maxChars) return text;
+  return text.slice(0, maxChars) + "… [truncated]";
+}
+
+/**
+ * Hierarchical summarization for oversized content.
+ * Chunks the text, summarizes each chunk via LLM, and combines.
+ * If the combined result is still over maxChars, recurses (up to maxDepth).
+ */
+async function summarizeContent(
+  text: string,
+  maxChars: number,
+  agentId: string,
+  depth = 0,
+): Promise<string> {
+  if (!text || text.length <= maxChars) return text;
+  if (depth >= 3) {
+    console.warn(`[SUMMARIZE] Max recursion depth reached, truncating remaining content.`);
+    return truncateForPrompt(text, maxChars);
+  }
+
+  // Chunk the text into pieces that safely fit in a CLI argument
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += SUMMARIZE_CHUNK_SIZE) {
+    chunks.push(text.slice(i, i + SUMMARIZE_CHUNK_SIZE));
+  }
+
+  console.log(`[SUMMARIZE] Content is ${text.length} chars (limit: ${maxChars}). Splitting into ${chunks.length} chunk(s) for summarization (depth=${depth}).`);
+
+  const summaries: string[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkPrompt = [
+      `You are a text summarization engine. Summarize the following text concisely,`,
+      `preserving ALL key facts, names, dates, relationships, preferences, and important details.`,
+      `Output ONLY the summary text, no preamble or formatting.`,
+      ``,
+      `TEXT:`,
+      chunks[i],
+    ].join("\n");
+
+    try {
+      const summary = await callLLMviaAgent(chunkPrompt, agentId);
+      summaries.push(summary.trim());
+      console.log(`[SUMMARIZE]   Chunk ${i + 1}/${chunks.length}: ${chunks[i].length} chars → ${summary.trim().length} chars`);
+    } catch (err: any) {
+      console.error(`[SUMMARIZE]   Chunk ${i + 1}/${chunks.length} failed: ${err.message}. Using truncated original.`);
+      summaries.push(truncateForPrompt(chunks[i], Math.floor(maxChars / chunks.length)));
+    }
+  }
+
+  const combined = summaries.join("\n\n");
+
+  // If still over limit, recursively summarize the combined summaries
+  if (combined.length > maxChars) {
+    console.log(`[SUMMARIZE] Combined summaries still ${combined.length} chars (limit: ${maxChars}). Recursing...`);
+    return summarizeContent(combined, maxChars, agentId, depth + 1);
+  }
+
+  return combined;
 }
 
 // SleepCycleResult and LinkClassification types are now imported from schemas
@@ -173,12 +243,18 @@ Do not use markdown formatting.
 `;
 
   async function processChunk(chunk: any[]): Promise<SleepCycleResult> {
-    const transcript = chunk
-      .map((e: Record<string, unknown>) => {
-        const row = e as EpisodicRow;
-        return `[${row.created_at}] [${row.event_type.toUpperCase()}]: ${row.event_summary}`;
-      })
-      .join("\n");
+    // Pre-summarize oversized event summaries to prevent E2BIG and context overflow
+    const transcriptLines: string[] = [];
+    for (const e of chunk) {
+      const row = e as EpisodicRow;
+      let summary = row.event_summary;
+      if (summary && summary.length > PROMPT_CONTENT_MAX_CHARS) {
+        console.log(`[PHASE 1] Pre-summarizing oversized event (${summary.length} chars, id=${row.id})...`);
+        summary = await summarizeContent(summary, PROMPT_CONTENT_MAX_CHARS, agentId);
+      }
+      transcriptLines.push(`[${row.created_at}] [${row.event_type.toUpperCase()}]: ${summary}`);
+    }
+    const transcript = transcriptLines.join("\n");
 
     const prompt = `${systemPrompt}\n\nHere is the recent episodic transcript to analyze:\n\n${transcript}`;
 
@@ -222,6 +298,18 @@ Do not use markdown formatting.
       const cleanString = extractJsonFromLlmOutput(jsonString);
       return SleepCycleResultSchema.parse(JSON.parse(cleanString));
     } catch (err: any) {
+      if (err instanceof SyntaxError) {
+        if (chunk.length > 1) {
+          console.warn(`[PHASE 1] ⚠️ JSON parse error (likely truncated output, chunk size: ${chunk.length}). Halving chunk and retrying...`);
+          const mid = Math.floor(chunk.length / 2);
+          const res1 = await processChunk(chunk.slice(0, mid));
+          const res2 = await processChunk(chunk.slice(mid));
+          return {
+            session_summary: (res1.session_summary || "") + (res2.session_summary ? " " + res2.session_summary : ""),
+            extracted_durable_facts: [...res1.extracted_durable_facts, ...res2.extracted_durable_facts]
+          };
+        }
+      }
       console.error(`\n[PHASE 1] ❌ FATAL PARSE ERROR`);
       console.error(`The internal LLM response could not be parsed as valid JSON.`);
       console.error(`This blocks the promotion of short-term memories into semantic facts.\n`);
@@ -588,7 +676,7 @@ Do not use markdown formatting.
 
   async function processBatch(batch: CandidatePair[], batchIndexHuman: number): Promise<LinkClassification[]> {
     const pairsDescription = batch
-      .map((p, idx) => `${idx + 1}. [A: ${p.source_type}/${p.source_id}] "${p.source_content}"\n   [B: ${p.target_type}/${p.target_id}] "${p.target_content}" (similarity: ${(p.similarity * 100).toFixed(1)}%)`)
+      .map((p, idx) => `${idx + 1}. [A: ${p.source_type}/${p.source_id}] "${truncateForPrompt(p.source_content, PROMPT_CONTENT_MAX_CHARS)}"\n   [B: ${p.target_type}/${p.target_id}] "${truncateForPrompt(p.target_content, PROMPT_CONTENT_MAX_CHARS)}" (similarity: ${(p.similarity * 100).toFixed(1)}%)`)
       .join("\n\n");
 
     const prompt = `${linkSystemPrompt}\n\nClassify the relationships between these pairs:\n\n${pairsDescription}`;
@@ -642,6 +730,15 @@ Do not use markdown formatting.
       const cleanString = extractJsonFromLlmOutput(jsonString);
       return z.array(LinkClassificationSchema).parse(JSON.parse(cleanString));
     } catch (err: any) {
+      if (err instanceof SyntaxError) {
+        if (batch.length > 1) {
+          console.warn(`[PHASE 4] ⚠️ JSON parse error (likely truncated, batch size: ${batch.length}). Halving batch and retrying...`);
+          const mid = Math.floor(batch.length / 2);
+          const res1 = await processBatch(batch.slice(0, mid), batchIndexHuman);
+          const res2 = await processBatch(batch.slice(mid), batchIndexHuman);
+          return [...res1, ...res2];
+        }
+      }
       console.error(`\n[PHASE 4] ⚠️ Parsing skipped for batch ${batchIndexHuman} (or a fragment of it).`);
       console.error(`[PHASE 4] Error details:`, err);
       console.error(`[PHASE 4] LLM response could not be parsed as a valid JSON array of relationships.`);
