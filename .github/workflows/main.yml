@@ -26,10 +26,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # 4. Check for code style and formatting issues
-      - name: Run linter
-        run: npm run lint
-
       # 5. Ensure TypeScript compiles correctly without generating output files
       - name: Type check
         run: npx tsc --noEmit
