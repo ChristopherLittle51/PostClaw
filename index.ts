@@ -31,6 +31,7 @@ export type { ChatMessage, ContentPart, ToolCallRecord } from "./schemas/validat
 // =============================================================================
 
 const processedEvents = new Set<string>();
+let _registered = false;
 
 import { getCurrentConfig, loadConfig } from "./services/config.js";
 
@@ -78,6 +79,10 @@ const openclawPostgresPlugin = {
   description: "PostgreSQL-backed RAG, memory, and persona management",
 
   register(api: any) {
+    if (_registered) {
+      return;
+    }
+    _registered = true;
     console.log("[PostClaw] Registering plugin hooks...");
 
     // Apply database URL from plugin config (plugins.entries.postclaw.config.dbUrl)

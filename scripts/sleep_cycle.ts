@@ -765,6 +765,9 @@ export async function runSleepCycle(opts: SleepCycleOptions = {}): Promise<Sleep
 let _serviceTimer: ReturnType<typeof setInterval> | null = null;
 
 export function startService(opts: SleepCycleOptions & { intervalHours?: number } = {}): void {
+  if (_serviceTimer) {
+    return;
+  }
   const intervalMs = (opts.intervalHours || DEFAULT_INTERVAL_HOURS) * 60 * 60 * 1000;
   const label = `${opts.intervalHours || DEFAULT_INTERVAL_HOURS}h`;
 
