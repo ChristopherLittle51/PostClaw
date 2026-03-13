@@ -21,24 +21,41 @@ import type {
   RequestPermissionResponse,
 } from "@agentclientprotocol/sdk" with { "resolution-mode": "import" };
 
-/**
- * Send a prompt to the OpenClaw Gateway via the ACP stdio bridge.
- * No ARG_MAX limit — the prompt travels over stdin, not CLI arguments.
- *
- * @param prompt  - The full prompt text (arbitrarily large)
- * @param agentId - The agent identifier (default: "main")
- * @returns         The LLM's text response
- */
-export async function sendPromptViaACP(
-  prompt: string,
-  agentId = "main",
-): Promise<string> {
-  // Dynamic import handles the ESM-only SDK from this CJS module at runtime.
-  const { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION } =
-    await import("@agentclientprotocol/sdk");
+// Errors that indicate a transient WebSocket / gateway connection failure.
+// These are safe to retry — the LLM is still running; we just need a new bridge.
+function isTransientError(err: Error): boolean {
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes("gateway disconnected") ||
+    msg.includes("-32603") ||
+    msg.includes("1005") ||
+    msg.includes("websocket") ||
+    msg.includes("econnreset") ||
+    msg.includes("econnrefused") ||
+    msg.includes("connection closed") ||
+    msg.includes("socket hang up")
+  );
+}
 
-  // 1. Spawn the ACP bridge as a child process.
-  //    --reset-session ensures a clean context per call (single-shot semantics).
+// Structural interface for the subset of the SDK we use, avoiding the
+// `typeof import(...)` pattern which TypeScript rejects in CJS→ESM context.
+interface AcpModules {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ClientSideConnection: new (toClient: (_agent: unknown) => Client, stream: any) => {
+    initialize(p: { protocolVersion: number }): Promise<unknown>;
+    newSession(p: { cwd: string; mcpServers: unknown[] }): Promise<{ sessionId: string }>;
+    prompt(p: { sessionId: string; prompt: Array<{ type: "text"; text: string }> }): Promise<unknown>;
+  };
+  ndJsonStream(writable: WritableStream<Uint8Array>, readable: ReadableStream<Uint8Array>): unknown;
+  PROTOCOL_VERSION: number;
+}
+
+/** Single connection attempt. Throws on any failure. */
+async function runAttempt(
+  prompt: string,
+  agentId: string,
+  { ClientSideConnection, ndJsonStream, PROTOCOL_VERSION }: AcpModules,
+): Promise<string> {
   const sessionKey = `agent:${agentId}:main`;
   const child: ChildProcess = spawn("openclaw", [
     "acp",
@@ -48,12 +65,10 @@ export async function sendPromptViaACP(
     stdio: ["pipe", "pipe", "pipe"],
   });
 
-  // Log stderr for debugging but don't treat it as a hard failure.
   child.stderr?.on("data", (chunk: Buffer) => {
     console.error(`[ACP stderr] ${chunk.toString().trim()}`);
   });
 
-  // Track whether the child exited early (before we got a response).
   let childExitCode: number | null = null;
   let childExited = false;
   const childClosePromise = new Promise<void>((resolve) => {
@@ -64,14 +79,10 @@ export async function sendPromptViaACP(
     });
   });
 
-  // 2. Build the ACP stream from the child's stdio.
-  //    ndJsonStream(writable, readable): writable = what we write TO (stdin),
-  //    readable = what we read FROM (stdout).
   const writableWeb = Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>;
   const readableWeb = Readable.toWeb(child.stdout!) as ReadableStream<Uint8Array>;
   const stream = ndJsonStream(writableWeb, readableWeb);
 
-  // 3. Accumulate response text from session/update notifications.
   let responseText = "";
 
   const clientHandler = (_agent: unknown): Client => ({
@@ -86,8 +97,6 @@ export async function sendPromptViaACP(
       return Promise.resolve();
     },
     requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-      // Auto-approve for internal pipeline calls.
-      // Pick the first "allow_once" option; fall back to the first option.
       const allowOption =
         params.options.find((o) => o.kind === "allow_once") ?? params.options[0];
       return Promise.resolve({
@@ -101,37 +110,21 @@ export async function sendPromptViaACP(
 
   const connection = new ClientSideConnection(clientHandler, stream);
 
-  // 4. Explicit 120-second timeout.
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  const timeoutPromise = new Promise<never>((_resolve, reject) => {
-    timeoutHandle = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error("ACP prompt timed out after 120 seconds"));
-    }, 120_000);
-  });
-
   try {
     const result = await Promise.race([
       (async () => {
-        // 5. Protocol handshake.
         await connection.initialize({ protocolVersion: PROTOCOL_VERSION });
-
-        // 6. Create a session.
         const session = await connection.newSession({
           cwd: process.cwd(),
           mcpServers: [],
         });
-
-        // 7. Send the prompt — travels over stdio, no ARG_MAX.
         await connection.prompt({
           sessionId: session.sessionId,
           prompt: [{ type: "text" as const, text: prompt }],
         });
-
         return responseText.trim();
       })(),
-      timeoutPromise,
-      // Fail fast if the child exits with an error before we get a response.
+      // Fail fast if the child exits with a non-zero code before we get a response.
       childClosePromise.then(() => {
         if (childExited && !responseText && childExitCode !== 0) {
           throw new Error(
@@ -144,9 +137,56 @@ export async function sendPromptViaACP(
 
     return result;
   } finally {
-    clearTimeout(timeoutHandle);
     if (!childExited) {
       child.kill("SIGTERM");
     }
   }
+}
+
+/**
+ * Send a prompt to the OpenClaw Gateway via the ACP stdio bridge.
+ * No ARG_MAX limit — the prompt travels over stdin, not CLI arguments.
+ *
+ * Automatically retries up to 3 times on transient WebSocket / gateway
+ * disconnection errors (e.g. JSON-RPC -32603, WS close code 1005).
+ *
+ * @param prompt  - The full prompt text (arbitrarily large)
+ * @param agentId - The agent identifier (default: "main")
+ * @returns         The LLM's text response
+ */
+export async function sendPromptViaACP(
+  prompt: string,
+  agentId = "main",
+): Promise<string> {
+  // Load the ESM-only SDK once; reused across retries.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const acpModules = await import("@agentclientprotocol/sdk") as any as AcpModules;
+
+  const MAX_RETRIES = 3;
+  let lastError: Error | undefined;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      // Exponential backoff: 2s, 4s before attempts 2 and 3.
+      const delayMs = 2 ** attempt * 1000;
+      console.warn(`[ACP] Gateway disconnected. Retry ${attempt}/${MAX_RETRIES - 1} in ${delayMs / 1000}s...`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+
+    try {
+      return await runAttempt(prompt, agentId, acpModules);
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      lastError = error;
+
+      if (attempt < MAX_RETRIES - 1 && isTransientError(error)) {
+        console.warn(`[ACP] Transient error on attempt ${attempt + 1}: ${error.message}`);
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw lastError ?? new Error("ACP bridge failed after all retries");
 }
