@@ -31,6 +31,7 @@ export type { ChatMessage, ContentPart, ToolCallRecord } from "./schemas/validat
 // =============================================================================
 
 const processedEvents = new Set<string>();
+let _registered = false;
 
 import { getCurrentConfig, loadConfig } from "./services/config.js";
 
@@ -78,6 +79,139 @@ const openclawPostgresPlugin = {
   description: "PostgreSQL-backed RAG, memory, and persona management",
 
   register(api: any) {
+    if (_registered) {
+      return;
+    }
+    _registered = true;
+
+    // Detect when invoked as a one-shot CLI subcommand (e.g. `openclaw postclaw sleep`).
+    // In that case we only need the CLI command registrations below — hooks, tools,
+    // and background services are gateway-only and produce unwanted noise in CLI runs.
+    // The CLI action handlers apply their own targeted config before executing.
+    const _isCliMode = process.argv.some(a =>
+      ['setup', 'persona', 'sleep', 'dashboard'].includes(a)
+    );
+
+    // -------------------------------------------------------------------------
+    // CLI — Register `openclaw postclaw` subcommands
+    //
+    // Registered unconditionally so OpenClaw always knows the subcommands exist,
+    // even when the plugin is loaded in a one-shot CLI context.
+    // -------------------------------------------------------------------------
+    api.registerCli(
+      ({ program }: { program: any }) => {
+        const postclaw = program.command("postclaw").description("PostClaw database management");
+
+        postclaw
+          .command("setup")
+          .description("Create and initialize the PostClaw PostgreSQL database")
+          .option("--admin-url <url>", "PostgreSQL superuser connection string (default: postgres://localhost/postgres)")
+          .option("--db-name <name>", "Database name (default: memorydb)")
+          .option("--db-user <user>", "App user name (default: openclaw)")
+          .option("--db-password <pass>", "App user password (auto-generated if omitted)")
+          .option("--skip-config", "Don't auto-update openclaw.json with the new dbUrl")
+          .action(async (opts: { adminUrl?: string; dbName?: string; dbUser?: string; dbPassword?: string; skipConfig?: boolean }) => {
+            const { runSetup } = await import("./scripts/setup-db.js");
+            await runSetup({
+              adminUrl: opts.adminUrl,
+              dbName: opts.dbName,
+              dbUser: opts.dbUser,
+              dbPassword: opts.dbPassword,
+              skipConfig: opts.skipConfig,
+            });
+
+            // Clean exit: Stop the timer and close the DB connection
+            stopService();
+            await getSql().end();
+          });
+
+        postclaw
+          .command("persona")
+          .argument("<file>", "Path to a Markdown persona file (e.g. SOUL.md, AGENTS.md)")
+          .description("Bootstrap a Markdown persona file into the agent_persona table")
+          .option("--agent-id <id>", "Agent ID to store persona under (default: main)")
+          .action(async (file: string, opts: { agentId?: string }) => {
+            // Ensure embedding config is set from OpenClaw config before running
+            const memCfg = api.config?.agents?.defaults?.memorySearch;
+            const llmUrl = memCfg?.remote?.baseUrl || "http://127.0.0.1:1234/v1";
+            const embModel = memCfg?.remote?.model || memCfg?.model || "text-embedding-nomic-embed-text-v2-moe";
+            setEmbeddingConfig(llmUrl, embModel);
+
+            // Apply dbUrl from plugin config
+            const pluginCfg = api.config?.plugins?.entries?.postclaw?.config;
+            if (pluginCfg?.dbUrl) {
+              setDbUrl(pluginCfg.dbUrl);
+            }
+
+            const { bootstrapPersona } = await import("./scripts/bootstrap_persona.js");
+            await bootstrapPersona(file, {
+              agentId: opts.agentId,
+            });
+
+            // Clean exit: Stop the timer and close the DB connection
+            stopService();
+            await getSql().end();
+          });
+
+        postclaw
+          .command("sleep")
+          .description("Run the sleep cycle (knowledge graph maintenance) manually")
+          .option("--agent-id <id>", "Agent ID to run maintenance for (default: main)")
+          .action(async (opts: { agentId?: string }) => {
+            // Ensure embedding config is set from OpenClaw config before running
+            const memCfg = api.config?.agents?.defaults?.memorySearch;
+            const llmUrl = memCfg?.remote?.baseUrl || "http://127.0.0.1:1234/v1";
+            const embModel = memCfg?.remote?.model || memCfg?.model || "text-embedding-nomic-embed-text-v2-moe";
+            setEmbeddingConfig(llmUrl, embModel);
+
+            // Apply dbUrl from plugin config
+            const pluginCfg = api.config?.plugins?.entries?.postclaw?.config;
+            if (pluginCfg?.dbUrl) {
+              setDbUrl(pluginCfg.dbUrl);
+            }
+
+            const { runSleepCycle } = await import("./scripts/sleep_cycle.js");
+            await runSleepCycle({
+              agentId: opts.agentId,
+            });
+
+            // Clean exit: Stop the timer and close the DB connection
+            stopService();
+            await getSql().end();
+          });
+        postclaw
+          .command("dashboard")
+          .description("Start the dashboard server standalone")
+          .option("--port <port>", "Port to listen on (default: 3333)")
+          .option("--bind <address>", "Bind address (default: 127.0.0.1)")
+          .action(async (opts: { port?: string; bind?: string }) => {
+            const pluginCfg = api.config?.plugins?.entries?.postclaw?.config;
+            if (pluginCfg?.dbUrl) {
+              setDbUrl(pluginCfg.dbUrl);
+            }
+            const memCfg = api.config?.agents?.defaults?.memorySearch;
+            const llmUrl = memCfg?.remote?.baseUrl || "http://127.0.0.1:1234/v1";
+            const embModel = memCfg?.remote?.model || memCfg?.model || "text-embedding-nomic-embed-text-v2-moe";
+            setEmbeddingConfig(llmUrl, embModel);
+
+            const { startDashboard } = await import("./dashboard/server.js");
+            startDashboard({
+              port: opts.port ? parseInt(opts.port, 10) : undefined,
+              bindAddress: opts.bind,
+            });
+            console.log("[PostClaw] Dashboard running. Press Ctrl+C to stop.");
+          });
+      },
+      { commands: ["postclaw"] },
+    );
+
+    // In CLI mode the subcommand action handles everything itself.
+    // Skip gateway-only setup: hooks, tools, and background services are not
+    // needed and their init logs would be unwanted noise in a CLI context.
+    if (_isCliMode) {
+      return;
+    }
+
     console.log("[PostClaw] Registering plugin hooks...");
 
     // Apply database URL from plugin config (plugins.entries.postclaw.config.dbUrl)
@@ -687,116 +821,6 @@ Changing content will re-embed the persona for situational matching. Categories 
         name: "PostClaw.message-received",
         description: "Caches inbound messages for before_prompt_build RAG injection",
       },
-    );
-
-    // -------------------------------------------------------------------------
-    // CLI — Register `openclaw postclaw setup` command
-    // -------------------------------------------------------------------------
-    api.registerCli(
-      ({ program }: { program: any }) => {
-        const postclaw = program.command("postclaw").description("PostClaw database management");
-
-        postclaw
-          .command("setup")
-          .description("Create and initialize the PostClaw PostgreSQL database")
-          .option("--admin-url <url>", "PostgreSQL superuser connection string (default: postgres://localhost/postgres)")
-          .option("--db-name <name>", "Database name (default: memorydb)")
-          .option("--db-user <user>", "App user name (default: openclaw)")
-          .option("--db-password <pass>", "App user password (auto-generated if omitted)")
-          .option("--skip-config", "Don't auto-update openclaw.json with the new dbUrl")
-          .action(async (opts: { adminUrl?: string; dbName?: string; dbUser?: string; dbPassword?: string; skipConfig?: boolean }) => {
-            const { runSetup } = await import("./scripts/setup-db.js");
-            await runSetup({
-              adminUrl: opts.adminUrl,
-              dbName: opts.dbName,
-              dbUser: opts.dbUser,
-              dbPassword: opts.dbPassword,
-              skipConfig: opts.skipConfig,
-            });
-
-            // Clean exit: Stop the timer and close the DB connection
-            stopService();
-            await getSql().end();
-          });
-
-        postclaw
-          .command("persona")
-          .argument("<file>", "Path to a Markdown persona file (e.g. SOUL.md, AGENTS.md)")
-          .description("Bootstrap a Markdown persona file into the agent_persona table")
-          .option("--agent-id <id>", "Agent ID to store persona under (default: main)")
-          .action(async (file: string, opts: { agentId?: string }) => {
-            // Ensure embedding config is set from OpenClaw config before running
-            const memCfg = api.config?.agents?.defaults?.memorySearch;
-            const llmUrl = memCfg?.remote?.baseUrl || "http://127.0.0.1:1234/v1";
-            const embModel = memCfg?.remote?.model || memCfg?.model || "text-embedding-nomic-embed-text-v2-moe";
-            setEmbeddingConfig(llmUrl, embModel);
-
-            // Apply dbUrl from plugin config
-            const pluginCfg = api.config?.plugins?.entries?.postclaw?.config;
-            if (pluginCfg?.dbUrl) {
-              setDbUrl(pluginCfg.dbUrl);
-            }
-
-            const { bootstrapPersona } = await import("./scripts/bootstrap_persona.js");
-            await bootstrapPersona(file, {
-              agentId: opts.agentId,
-            });
-
-            // Clean exit: Stop the timer and close the DB connection
-            stopService();
-            await getSql().end();
-          });
-
-        postclaw
-          .command("sleep")
-          .description("Run the sleep cycle (knowledge graph maintenance) manually")
-          .option("--agent-id <id>", "Agent ID to run maintenance for (default: main)")
-          .action(async (opts: { agentId?: string }) => {
-            // Ensure embedding config is set from OpenClaw config before running
-            const memCfg = api.config?.agents?.defaults?.memorySearch;
-            const llmUrl = memCfg?.remote?.baseUrl || "http://127.0.0.1:1234/v1";
-            const embModel = memCfg?.remote?.model || memCfg?.model || "text-embedding-nomic-embed-text-v2-moe";
-            setEmbeddingConfig(llmUrl, embModel);
-
-            // Apply dbUrl from plugin config
-            const pluginCfg = api.config?.plugins?.entries?.postclaw?.config;
-            if (pluginCfg?.dbUrl) {
-              setDbUrl(pluginCfg.dbUrl);
-            }
-
-            const { runSleepCycle } = await import("./scripts/sleep_cycle.js");
-            await runSleepCycle({
-              agentId: opts.agentId,
-            });
-
-            // Clean exit: Stop the timer and close the DB connection
-            stopService();
-            await getSql().end();
-          });
-        postclaw
-          .command("dashboard")
-          .description("Start the dashboard server standalone")
-          .option("--port <port>", "Port to listen on (default: 3333)")
-          .option("--bind <address>", "Bind address (default: 127.0.0.1)")
-          .action(async (opts: { port?: string; bind?: string }) => {
-            const pluginCfg = api.config?.plugins?.entries?.postclaw?.config;
-            if (pluginCfg?.dbUrl) {
-              setDbUrl(pluginCfg.dbUrl);
-            }
-            const memCfg = api.config?.agents?.defaults?.memorySearch;
-            const llmUrl = memCfg?.remote?.baseUrl || "http://127.0.0.1:1234/v1";
-            const embModel = memCfg?.remote?.model || memCfg?.model || "text-embedding-nomic-embed-text-v2-moe";
-            setEmbeddingConfig(llmUrl, embModel);
-
-            const { startDashboard } = await import("./dashboard/server.js");
-            startDashboard({
-              port: opts.port ? parseInt(opts.port, 10) : undefined,
-              bindAddress: opts.bind,
-            });
-            console.log("[PostClaw] Dashboard running. Press Ctrl+C to stop.");
-          });
-      },
-      { commands: ["postclaw"] },
     );
 
     // ─────────────────────────────────────────────────────────────────────────
