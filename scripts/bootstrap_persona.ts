@@ -16,7 +16,7 @@ import { readFile } from "fs/promises";
 import { resolve } from "path";
 import { getSql, getEmbedding, setEmbeddingConfig, LM_STUDIO_URL, EMBEDDING_MODEL } from "../services/db.js";
 import { ensureAgent } from "../services/memoryService.js";
-import { callLLMviaAgent } from "../services/llm.js";
+import { sendPromptViaACP } from "../src/acp-client.js";
 import { z } from "zod";
 import { PersonaChunkSchema, type PersonaChunk } from "../schemas/validation.js";
 
@@ -44,7 +44,7 @@ Each object must have:
 
   // Route through OpenClaw's configured primary model via the CLI
   const combined = `${systemPrompt}\n\nHere is the file to chunk:\n\n${markdownText}`;
-  const jsonString = await callLLMviaAgent(combined, agentId);
+  const jsonString = await sendPromptViaACP(combined, agentId);
 
   try {
     return z.array(PersonaChunkSchema).parse(JSON.parse(jsonString));

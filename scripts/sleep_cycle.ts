@@ -17,15 +17,11 @@
 import { getSql, getEmbedding, LM_STUDIO_URL, validateEmbeddingDimension } from "../services/db.js";
 import { ensureAgent } from "../services/memoryService.js";
 import { loadConfig } from "../services/config.js";
-import { callLLMviaAgent } from "../services/llm.js";
-import { z } from "zod";
+import { sendPromptViaACP } from "../src/acp-client.js";
 import {
   SleepCycleResultSchema,
-  LinkClassificationSchema,
   type SleepCycleResult,
-  type LinkClassification,
   type EpisodicRow,
-  type MemorySemanticRow,
   type DuplicateCandidateRow,
   type StaleMemoryRow,
 } from "../schemas/validation.js";
@@ -182,41 +178,7 @@ Do not use markdown formatting.
 
     const prompt = `${systemPrompt}\n\nHere is the recent episodic transcript to analyze:\n\n${transcript}`;
 
-    let jsonString = "";
-    try {
-      jsonString = await callLLMviaAgent(prompt, agentId);
-    } catch (err: any) {
-      if (err.message && err.message.includes('E2BIG')) {
-        if (chunk.length > 1) {
-          console.warn(`[PHASE 1] ⚠️ E2BIG error (chunk size: ${chunk.length}). Halving chunk and retrying...`);
-          const mid = Math.floor(chunk.length / 2);
-          const res1 = await processChunk(chunk.slice(0, mid));
-          const res2 = await processChunk(chunk.slice(mid));
-          return {
-            session_summary: (res1.session_summary || "") + (res2.session_summary ? " " + res2.session_summary : ""),
-            extracted_durable_facts: [...res1.extracted_durable_facts, ...res2.extracted_durable_facts]
-          };
-        } else {
-          console.warn(`[PHASE 1] ⚠️ E2BIG error on a SINGLE record. Halving the text content itself...`);
-          const row = chunk[0] as EpisodicRow;
-          const text = row.event_summary || "";
-          if (text.length < 100) {
-            console.error(`[PHASE 1] Text content too short to halve further, failing...`);
-            throw err;
-          }
-          const mid = Math.floor(text.length / 2);
-          const row1 = { ...row, event_summary: text.slice(0, mid) + " [CONTINUED]" };
-          const row2 = { ...row, event_summary: "[CONTINUED] " + text.slice(mid) };
-          const res1 = await processChunk([row1]);
-          const res2 = await processChunk([row2]);
-          return {
-            session_summary: (res1.session_summary || "") + (res2.session_summary ? " " + res2.session_summary : ""),
-            extracted_durable_facts: [...res1.extracted_durable_facts, ...res2.extracted_durable_facts]
-          };
-        }
-      }
-      throw err;
-    }
+    const jsonString = await sendPromptViaACP(prompt, agentId);
 
     try {
       const cleanString = extractJsonFromLlmOutput(jsonString);
@@ -563,135 +525,109 @@ async function phaseLinkDiscovery(agentId: string, options: { min: number; max: 
   const crossCount = candidatePairs.length - memMemCount;
   console.log(`[PHASE 4] Found ${candidatePairs.length} candidate pairs (${memMemCount} memory↔memory, ${crossCount} persona↔memory). Classifying relationships...`);
 
+  // POSTCLAW_FAST_LINKING=true skips LLM classification and uses similarity
+  // thresholds instead. Useful for development or when LLM is unavailable.
+  const fastLinking = process.env.POSTCLAW_FAST_LINKING === "true";
+
+  // Classify all pairs via LLM (full 7-type vocabulary)
+  const pairRelationships = new Map<string, string>();
+
+  if (fastLinking) {
+    console.log(`[PHASE 4] Fast-linking mode enabled. Using similarity thresholds.`);
+    for (const pair of candidatePairs) {
+      const pairKey = [pair.source_id, pair.target_id].join(":");
+      pairRelationships.set(pairKey, pair.similarity >= 0.85 ? "strong_link" : "related_to");
+    }
+  } else {
+    // Build a batch prompt for all pairs at once.
+    const linkSystemPrompt = `You are a knowledge graph relationship classifier.
+Given pairs of memory entries, classify the semantic relationship between each pair.
+
+Use EXACTLY one of these relationship types:
+- elaborates: one entry provides additional detail or context for the other
+- contradicts: one entry conflicts with or disputes the other
+- depends_on: one entry requires the other to be true or applicable
+- part_of: one entry is a component, subset, or instance of the other
+- defines: one entry provides the definition or meaning of the other
+- supports: one entry provides evidence or reasoning that strengthens the other
+- related_to: the entries are topically related but don't fit the above types
+
+Output EXCLUSIVELY a JSON array (no markdown, no explanation) with one object per pair:
+[
+  { "pair_index": 0, "relationship": "<type>" },
+  ...
+]`;
+
+    const pairsText = candidatePairs.map((pair, i) => (
+      `Pair ${i}:\n  A: ${pair.source_content.substring(0, 500)}\n  B: ${pair.target_content.substring(0, 500)}`
+    )).join("\n\n");
+
+    const batchPrompt = `${linkSystemPrompt}\n\nPairs to classify:\n\n${pairsText}`;
+
+    const validRelationships = new Set([
+      "elaborates", "contradicts", "depends_on", "part_of",
+      "defines", "supports", "related_to",
+    ]);
+
+    try {
+      const jsonString = await sendPromptViaACP(batchPrompt, agentId);
+      const cleanString = extractJsonFromLlmOutput(jsonString);
+      const classifications = JSON.parse(cleanString) as Array<{ pair_index: number; relationship: string }>;
+
+      for (const item of classifications) {
+        const pair = candidatePairs[item.pair_index];
+        if (!pair) continue;
+        const rel = validRelationships.has(item.relationship) ? item.relationship : "related_to";
+        pairRelationships.set([pair.source_id, pair.target_id].join(":"), rel);
+      }
+    } catch (err: any) {
+      console.warn(`[PHASE 4] ⚠️ LLM classification failed: ${err.message}. Falling back to related_to for all pairs.`);
+    }
+
+    // Any pair not classified by LLM gets "related_to" as a safe default.
+    for (const pair of candidatePairs) {
+      const key = [pair.source_id, pair.target_id].join(":");
+      if (!pairRelationships.has(key)) {
+        pairRelationships.set(key, "related_to");
+      }
+    }
+  }
+
   let linksCreated = 0;
 
-  const linkSystemPrompt = `
-You are a knowledge graph relationship classifier.
-Given pairs of memory entries and/or persona traits, classify the relationship between them.
+  await sql.begin(async (tx: any) => {
+    await tx`SELECT set_config('app.current_agent_id', ${agentId}, true)`;
 
-Valid relationship types:
-- "related_to" — general topical relation
-- "elaborates" — B provides more detail about A
-- "contradicts" — B conflicts with or corrects A
-- "depends_on" — B depends on knowledge from A
-- "part_of" — B is a component/subset of A
-- "defines" — A (usually a persona trait) defines the context for B (a memory)
-- "supports" — B provides evidence or backing for A
-- "none" — no meaningful relationship worth linking
+    for (const pair of candidatePairs) {
+      const relationship = pairRelationships.get([pair.source_id, pair.target_id].join(":")) ?? "related_to";
 
-Output EXCLUSIVELY a JSON array of objects:
-[{"source_id": "...", "target_id": "...", "relationship": "..."}]
+      if (relationship === "none") continue;
 
-Use "none" for pairs that don't have a meaningful relationship worth persisting.
-Do not use markdown formatting.
-`;
-
-  async function processBatch(batch: CandidatePair[], batchIndexHuman: number): Promise<LinkClassification[]> {
-    const pairsDescription = batch
-      .map((p, idx) => `${idx + 1}. [A: ${p.source_type}/${p.source_id}] "${p.source_content}"\n   [B: ${p.target_type}/${p.target_id}] "${p.target_content}" (similarity: ${(p.similarity * 100).toFixed(1)}%)`)
-      .join("\n\n");
-
-    const prompt = `${linkSystemPrompt}\n\nClassify the relationships between these pairs:\n\n${pairsDescription}`;
-
-    let jsonString = "";
-    try {
-      jsonString = await callLLMviaAgent(prompt, agentId);
-    } catch (err: any) {
-      if (err.message && err.message.includes('E2BIG')) {
-        if (batch.length > 1) {
-          console.warn(`[PHASE 4] ⚠️ E2BIG error (batch size: ${batch.length}). Halving batch and retrying...`);
-          const mid = Math.floor(batch.length / 2);
-          const res1 = await processBatch(batch.slice(0, mid), batchIndexHuman);
-          const res2 = await processBatch(batch.slice(mid), batchIndexHuman);
-          return [...res1, ...res2];
-        } else {
-          console.warn(`[PHASE 4] ⚠️ E2BIG error on a SINGLE pair. Text content is too large. Halving text to prevent crash...`);
-          const p = batch[0] as CandidatePair;
-          const sc = p.source_content || "";
-          const tc = p.target_content || "";
-          
-          if (sc.length < 100 && tc.length < 100) {
-            console.error(`[PHASE 4] Text content too short to halve further, failing...`);
-            throw err;
-          }
-
-          const scMid = Math.floor(sc.length / 2);
-          const tcMid = Math.floor(tc.length / 2);
-          const p1 = { ...p, source_content: sc.slice(0, scMid) + " [CONTINUED]", target_content: tc.slice(0, tcMid) + " [CONTINUED]" };
-          const p2 = { ...p, source_content: "[CONTINUED] " + sc.slice(scMid), target_content: "[CONTINUED] " + tc.slice(tcMid) };
-          
-          const res1 = await processBatch([p1], batchIndexHuman);
-          const res2 = await processBatch([p2], batchIndexHuman);
-          
-          // Deduplicate the arrays by source_id+target_id mapping
-          const combined = [...res1, ...res2];
-          const uniqueDict: Record<string, LinkClassification> = {};
-          for (const item of combined) {
-             const key = `${item.source_id}:${item.target_id}`;
-             if (!uniqueDict[key] || uniqueDict[key].relationship === 'none') {
-                 uniqueDict[key] = item;
-             }
-          }
-          return Object.values(uniqueDict);
-        }
+      try {
+        await tx`
+          INSERT INTO entity_edges (
+            agent_id,
+            source_memory_id, target_memory_id,
+            source_persona_id, target_persona_id,
+            relationship_type, weight
+          ) VALUES (
+            ${agentId},
+            ${pair.source_type === "memory" ? pair.source_id : null},
+            ${pair.target_type === "memory" ? pair.target_id : null},
+            ${pair.source_type === "persona" ? pair.source_id : null},
+            ${pair.target_type === "persona" ? pair.target_id : null},
+            ${relationship}, ${pair.similarity}
+          )
+          ON CONFLICT DO NOTHING;
+        `;
+        linksCreated++;
+        const linkLabel = `${pair.source_type}/${pair.source_id.substring(0, 8)} → ${pair.target_type}/${pair.target_id.substring(0, 8)}`;
+        console.log(`[PHASE 4] -> Linked: ${linkLabel} as "${relationship}"`);
+      } catch (err) {
+        console.error(`[PHASE 4] Failed to insert edge: ${err}`);
       }
-      throw err;
     }
-
-    try {
-      const cleanString = extractJsonFromLlmOutput(jsonString);
-      return z.array(LinkClassificationSchema).parse(JSON.parse(cleanString));
-    } catch (err: any) {
-      console.error(`\n[PHASE 4] ⚠️ Parsing skipped for batch ${batchIndexHuman} (or a fragment of it).`);
-      console.error(`[PHASE 4] Error details:`, err);
-      console.error(`[PHASE 4] LLM response could not be parsed as a valid JSON array of relationships.`);
-      console.error(`[PHASE 4] Raw LLM Output:\n${jsonString}\n`);
-      return [];
-    }
-  }
-
-  for (let i = 0; i < candidatePairs.length; i += options.batchSize) {
-    const batch = candidatePairs.slice(i, i + options.batchSize);
-    const batchIndexHuman = Math.floor(i / options.batchSize) + 1;
-
-    const classifications = await processBatch(batch, batchIndexHuman);
-
-    await sql.begin(async (tx: any) => {
-      await tx`SELECT set_config('app.current_agent_id', ${agentId}, true)`;
-
-      for (const cls of classifications) {
-        if (cls.relationship === "none" || !cls.relationship) continue;
-
-        // Determine which FK columns to populate based on the original pair's types
-        const originalPair = batch.find(p => p.source_id === cls.source_id && p.target_id === cls.target_id);
-        if (!originalPair) continue;
-
-        try {
-          await tx`
-            INSERT INTO entity_edges (
-              agent_id,
-              source_memory_id, target_memory_id,
-              source_persona_id, target_persona_id,
-              relationship_type, weight
-            ) VALUES (
-              ${agentId},
-              ${originalPair.source_type === "memory" ? cls.source_id : null},
-              ${originalPair.target_type === "memory" ? cls.target_id : null},
-              ${originalPair.source_type === "persona" ? cls.source_id : null},
-              ${originalPair.target_type === "persona" ? cls.target_id : null},
-              ${cls.relationship}, ${originalPair.similarity}
-            )
-            ON CONFLICT DO NOTHING;
-          `;
-          linksCreated++;
-          const linkLabel = `${originalPair.source_type}/${cls.source_id.substring(0, 8)} → ${originalPair.target_type}/${cls.target_id.substring(0, 8)}`;
-          console.log(`[PHASE 4] -> Linked: ${linkLabel} as "${cls.relationship}"`);
-        } catch (err) {
-          console.error(`[PHASE 4] Failed to insert edge: ${err}`);
-        }
-      }
-    });
-  }
+  });
 
   console.log(`[PHASE 4] Created ${linksCreated} new knowledge graph edges.`);
   return linksCreated;

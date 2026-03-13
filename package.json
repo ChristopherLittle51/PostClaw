@@ -40,6 +40,7 @@
     ]
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^0.16.1",
     "@ambientcss/css": "^1.1.1",
     "@sinclair/typebox": "^0.34.48",
     "dotenv": "^17.3.1",
