@@ -180,21 +180,26 @@ Do not use markdown formatting.
     }
     const transcript = transcriptLines.join("\n");
 
-    const prompt = `${systemPrompt}\n\nHere is the recent episodic transcript to analyze:\n\n${transcript}`;
+    const prompt = `[POSTCLAW_INTERNAL_LLM_CALL_DO_NOT_LOG]\n${systemPrompt}\n\nHere is the recent episodic transcript to analyze:\n\n${transcript}`;
 
     const jsonString = await sendPromptViaACP(prompt, agentId);
+
+    if (!jsonString) {
+      console.warn(`[PHASE 1] ⚠️  LLM returned an empty response — skipping consolidation for this chunk.`);
+      return { session_summary: "Consolidation skipped: LLM returned no output.", extracted_durable_facts: [] };
+    }
 
     try {
       const cleanString = extractJsonFromLlmOutput(jsonString);
       return SleepCycleResultSchema.parse(JSON.parse(cleanString));
     } catch (err: any) {
-      console.error(`\n[PHASE 1] ❌ FATAL PARSE ERROR`);
+      console.error(`\n[PHASE 1] ❌ PARSE ERROR`);
       console.error(`The internal LLM response could not be parsed as valid JSON.`);
-      console.error(`This blocks the promotion of short-term memories into semantic facts.\n`);
+      console.error(`Skipping consolidation for this chunk.\n`);
       console.error(`=== RAW LLM OUTPUT ===`);
       console.error(jsonString);
       console.error(`======================\n`);
-      throw new Error(`Episodic consolidation parsing failed: ${err.message}`);
+      return { session_summary: "Consolidation skipped: LLM output was not valid JSON.", extracted_durable_facts: [] };
     }
   }
 
@@ -566,7 +571,7 @@ Output EXCLUSIVELY a JSON array (no markdown, no explanation) with one object pe
       `Pair ${i}:\n  A: ${pair.source_content.substring(0, 500)}\n  B: ${pair.target_content.substring(0, 500)}`
     )).join("\n\n");
 
-    const batchPrompt = `${linkSystemPrompt}\n\nPairs to classify:\n\n${pairsText}`;
+    const batchPrompt = `[POSTCLAW_INTERNAL_LLM_CALL_DO_NOT_LOG]\n${linkSystemPrompt}\n\nPairs to classify:\n\n${pairsText}`;
 
     const validRelationships = new Set([
       "elaborates", "contradicts", "depends_on", "part_of",
