@@ -17,7 +17,7 @@
 import { getSql, getEmbedding, LM_STUDIO_URL, validateEmbeddingDimension } from "../services/db.js";
 import { ensureAgent } from "../services/memoryService.js";
 import { loadConfig } from "../services/config.js";
-import { callLLMviaAgent } from "../services/llm.js";
+import { sendPromptViaACP } from "../src/acp-client.js";
 import { z } from "zod";
 import {
   SleepCycleResultSchema,
@@ -51,10 +51,6 @@ const DEFAULT_LINK_SIMILARITY_MAX = 0.92;
 const DEFAULT_LINK_CANDIDATES_PER_MEMORY = 5;
 const DEFAULT_LINK_BATCH_SIZE = 20;
 const DEFAULT_LINK_SCAN_LIMIT = 50;
-
-// Content size management — prevents E2BIG (ARG_MAX) errors and LLM context overflow
-const SUMMARIZE_CHUNK_SIZE = 30_000;     // chars per LLM summarization chunk (~7.5K tokens)
-const PROMPT_CONTENT_MAX_CHARS = 2_000;  // max chars per content item in final prompts
 
 // Background service
 const DEFAULT_INTERVAL_HOURS = 6;
@@ -98,72 +94,6 @@ function extractJsonFromLlmOutput(text: string): string {
 
   // 3. Fallback to just returning the trimmed string and letting JSON.parse try
   return text.trim();
-}
-
-/**
- * Truncate text to maxChars with a suffix indicating truncation.
- * Used for Phase 4 pair descriptions where an LLM call isn't worth the cost.
- */
-function truncateForPrompt(text: string, maxChars: number): string {
-  if (!text || text.length <= maxChars) return text;
-  return text.slice(0, maxChars) + "… [truncated]";
-}
-
-/**
- * Hierarchical summarization for oversized content.
- * Chunks the text, summarizes each chunk via LLM, and combines.
- * If the combined result is still over maxChars, recurses (up to maxDepth).
- */
-async function summarizeContent(
-  text: string,
-  maxChars: number,
-  agentId: string,
-  depth = 0,
-): Promise<string> {
-  if (!text || text.length <= maxChars) return text;
-  if (depth >= 3) {
-    console.warn(`[SUMMARIZE] Max recursion depth reached, truncating remaining content.`);
-    return truncateForPrompt(text, maxChars);
-  }
-
-  // Chunk the text into pieces that safely fit in a CLI argument
-  const chunks: string[] = [];
-  for (let i = 0; i < text.length; i += SUMMARIZE_CHUNK_SIZE) {
-    chunks.push(text.slice(i, i + SUMMARIZE_CHUNK_SIZE));
-  }
-
-  console.log(`[SUMMARIZE] Content is ${text.length} chars (limit: ${maxChars}). Splitting into ${chunks.length} chunk(s) for summarization (depth=${depth}).`);
-
-  const summaries: string[] = [];
-  for (let i = 0; i < chunks.length; i++) {
-    const chunkPrompt = [
-      `You are a text summarization engine. Summarize the following text concisely,`,
-      `preserving ALL key facts, names, dates, relationships, preferences, and important details.`,
-      `Output ONLY the summary text, no preamble or formatting.`,
-      ``,
-      `TEXT:`,
-      chunks[i],
-    ].join("\n");
-
-    try {
-      const summary = await callLLMviaAgent(chunkPrompt, agentId);
-      summaries.push(summary.trim());
-      console.log(`[SUMMARIZE]   Chunk ${i + 1}/${chunks.length}: ${chunks[i].length} chars → ${summary.trim().length} chars`);
-    } catch (err: any) {
-      console.error(`[SUMMARIZE]   Chunk ${i + 1}/${chunks.length} failed: ${err.message}. Using truncated original.`);
-      summaries.push(truncateForPrompt(chunks[i], Math.floor(maxChars / chunks.length)));
-    }
-  }
-
-  const combined = summaries.join("\n\n");
-
-  // If still over limit, recursively summarize the combined summaries
-  if (combined.length > maxChars) {
-    console.log(`[SUMMARIZE] Combined summaries still ${combined.length} chars (limit: ${maxChars}). Recursing...`);
-    return summarizeContent(combined, maxChars, agentId, depth + 1);
-  }
-
-  return combined;
 }
 
 // SleepCycleResult and LinkClassification types are now imported from schemas
@@ -243,73 +173,21 @@ Do not use markdown formatting.
 `;
 
   async function processChunk(chunk: any[]): Promise<SleepCycleResult> {
-    // Pre-summarize oversized event summaries to prevent E2BIG and context overflow
     const transcriptLines: string[] = [];
     for (const e of chunk) {
       const row = e as EpisodicRow;
-      let summary = row.event_summary;
-      if (summary && summary.length > PROMPT_CONTENT_MAX_CHARS) {
-        console.log(`[PHASE 1] Pre-summarizing oversized event (${summary.length} chars, id=${row.id})...`);
-        summary = await summarizeContent(summary, PROMPT_CONTENT_MAX_CHARS, agentId);
-      }
-      transcriptLines.push(`[${row.created_at}] [${row.event_type.toUpperCase()}]: ${summary}`);
+      transcriptLines.push(`[${row.created_at}] [${row.event_type.toUpperCase()}]: ${row.event_summary}`);
     }
     const transcript = transcriptLines.join("\n");
 
     const prompt = `${systemPrompt}\n\nHere is the recent episodic transcript to analyze:\n\n${transcript}`;
 
-    let jsonString = "";
-    try {
-      jsonString = await callLLMviaAgent(prompt, agentId);
-    } catch (err: any) {
-      if (err.message && err.message.includes('E2BIG')) {
-        if (chunk.length > 1) {
-          console.warn(`[PHASE 1] ⚠️ E2BIG error (chunk size: ${chunk.length}). Halving chunk and retrying...`);
-          const mid = Math.floor(chunk.length / 2);
-          const res1 = await processChunk(chunk.slice(0, mid));
-          const res2 = await processChunk(chunk.slice(mid));
-          return {
-            session_summary: (res1.session_summary || "") + (res2.session_summary ? " " + res2.session_summary : ""),
-            extracted_durable_facts: [...res1.extracted_durable_facts, ...res2.extracted_durable_facts]
-          };
-        } else {
-          console.warn(`[PHASE 1] ⚠️ E2BIG error on a SINGLE record. Halving the text content itself...`);
-          const row = chunk[0] as EpisodicRow;
-          const text = row.event_summary || "";
-          if (text.length < 100) {
-            console.error(`[PHASE 1] Text content too short to halve further, failing...`);
-            throw err;
-          }
-          const mid = Math.floor(text.length / 2);
-          const row1 = { ...row, event_summary: text.slice(0, mid) + " [CONTINUED]" };
-          const row2 = { ...row, event_summary: "[CONTINUED] " + text.slice(mid) };
-          const res1 = await processChunk([row1]);
-          const res2 = await processChunk([row2]);
-          return {
-            session_summary: (res1.session_summary || "") + (res2.session_summary ? " " + res2.session_summary : ""),
-            extracted_durable_facts: [...res1.extracted_durable_facts, ...res2.extracted_durable_facts]
-          };
-        }
-      }
-      throw err;
-    }
+    const jsonString = await sendPromptViaACP(prompt, agentId);
 
     try {
       const cleanString = extractJsonFromLlmOutput(jsonString);
       return SleepCycleResultSchema.parse(JSON.parse(cleanString));
     } catch (err: any) {
-      if (err instanceof SyntaxError) {
-        if (chunk.length > 1) {
-          console.warn(`[PHASE 1] ⚠️ JSON parse error (likely truncated output, chunk size: ${chunk.length}). Halving chunk and retrying...`);
-          const mid = Math.floor(chunk.length / 2);
-          const res1 = await processChunk(chunk.slice(0, mid));
-          const res2 = await processChunk(chunk.slice(mid));
-          return {
-            session_summary: (res1.session_summary || "") + (res2.session_summary ? " " + res2.session_summary : ""),
-            extracted_durable_facts: [...res1.extracted_durable_facts, ...res2.extracted_durable_facts]
-          };
-        }
-      }
       console.error(`\n[PHASE 1] ❌ FATAL PARSE ERROR`);
       console.error(`The internal LLM response could not be parsed as valid JSON.`);
       console.error(`This blocks the promotion of short-term memories into semantic facts.\n`);
@@ -649,7 +527,75 @@ async function phaseLinkDiscovery(agentId: string, options: { min: number; max: 
 
   const memMemCount = candidatePairs.filter(p => p.source_type === "memory" && p.target_type === "memory").length;
   const crossCount = candidatePairs.length - memMemCount;
-  console.log(`[PHASE 4] Found ${candidatePairs.length} candidate pairs (${memMemCount} memory↔memory, ${crossCount} persona↔memory). Creating relationship edges...`);
+  console.log(`[PHASE 4] Found ${candidatePairs.length} candidate pairs (${memMemCount} memory↔memory, ${crossCount} persona↔memory). Classifying relationships...`);
+
+  // POSTCLAW_FAST_LINKING=true skips LLM classification and uses similarity
+  // thresholds instead. Useful for development or when LLM is unavailable.
+  const fastLinking = process.env.POSTCLAW_FAST_LINKING === "true";
+
+  // Classify all pairs via LLM (full 7-type vocabulary)
+  const pairRelationships = new Map<string, string>();
+
+  if (fastLinking) {
+    console.log(`[PHASE 4] Fast-linking mode enabled. Using similarity thresholds.`);
+    for (const pair of candidatePairs) {
+      const pairKey = [pair.source_id, pair.target_id].join(":");
+      pairRelationships.set(pairKey, pair.similarity >= 0.85 ? "strong_link" : "related_to");
+    }
+  } else {
+    // Build a batch prompt for all pairs at once.
+    const linkSystemPrompt = `You are a knowledge graph relationship classifier.
+Given pairs of memory entries, classify the semantic relationship between each pair.
+
+Use EXACTLY one of these relationship types:
+- elaborates: one entry provides additional detail or context for the other
+- contradicts: one entry conflicts with or disputes the other
+- depends_on: one entry requires the other to be true or applicable
+- part_of: one entry is a component, subset, or instance of the other
+- defines: one entry provides the definition or meaning of the other
+- supports: one entry provides evidence or reasoning that strengthens the other
+- related_to: the entries are topically related but don't fit the above types
+
+Output EXCLUSIVELY a JSON array (no markdown, no explanation) with one object per pair:
+[
+  { "pair_index": 0, "relationship": "<type>" },
+  ...
+]`;
+
+    const pairsText = candidatePairs.map((pair, i) => (
+      `Pair ${i}:\n  A: ${pair.source_content.substring(0, 500)}\n  B: ${pair.target_content.substring(0, 500)}`
+    )).join("\n\n");
+
+    const batchPrompt = `${linkSystemPrompt}\n\nPairs to classify:\n\n${pairsText}`;
+
+    const validRelationships = new Set([
+      "elaborates", "contradicts", "depends_on", "part_of",
+      "defines", "supports", "related_to",
+    ]);
+
+    try {
+      const jsonString = await sendPromptViaACP(batchPrompt, agentId);
+      const cleanString = extractJsonFromLlmOutput(jsonString);
+      const classifications = JSON.parse(cleanString) as Array<{ pair_index: number; relationship: string }>;
+
+      for (const item of classifications) {
+        const pair = candidatePairs[item.pair_index];
+        if (!pair) continue;
+        const rel = validRelationships.has(item.relationship) ? item.relationship : "related_to";
+        pairRelationships.set([pair.source_id, pair.target_id].join(":"), rel);
+      }
+    } catch (err: any) {
+      console.warn(`[PHASE 4] ⚠️ LLM classification failed: ${err.message}. Falling back to related_to for all pairs.`);
+    }
+
+    // Any pair not classified by LLM gets "related_to" as a safe default.
+    for (const pair of candidatePairs) {
+      const key = [pair.source_id, pair.target_id].join(":");
+      if (!pairRelationships.has(key)) {
+        pairRelationships.set(key, "related_to");
+      }
+    }
+  }
 
   let linksCreated = 0;
 
@@ -657,10 +603,7 @@ async function phaseLinkDiscovery(agentId: string, options: { min: number; max: 
     await tx`SELECT set_config('app.current_agent_id', ${agentId}, true)`;
 
     for (const pair of candidatePairs) {
-      // Pure vector similarity classification
-      // >= 0.85 is a strong link (near duplicate/direct continuation)
-      // < 0.85 is a standard topical relationship
-      const relationship = pair.similarity >= 0.85 ? "strong_link" : "related_to";
+      const relationship = pairRelationships.get([pair.source_id, pair.target_id].join(":")) ?? "related_to";
 
       try {
         await tx`
