@@ -790,9 +790,17 @@ Changing content will re-embed the persona for situational matching. Categories 
 
     // ─────────────────────────────────────────────────────────────────────────
     // BACKGROUND SERVICE — Start sleep cycle on an interval
+    //
+    // Only runs in long-lived gateway processes. Skip for one-shot commands
+    // (e.g. `openclaw agent --json`, `openclaw gateway restart`) that would
+    // otherwise hang due to the setInterval keeping the event loop alive.
     // ─────────────────────────────────────────────────────────────────────────
+    const _isOneShotCommand = process.argv.some(a =>
+      ['agent', 'setup', 'persona', 'sleep', 'dashboard', 'restart', 'stop', 'status', 'logs'].includes(a)
+    );
+
     const sleepIntervalHours = api.config?.plugins?.entries?.postclaw?.config?.sleepIntervalHours;
-    if (sleepIntervalHours !== 0) {
+    if (!_isOneShotCommand && sleepIntervalHours !== 0) {
       // Start the background sleep cycle service (0 = disabled)
       import("./scripts/sleep_cycle.js").then(({ startService }) => {
         const config = getCurrentConfig();
@@ -809,7 +817,7 @@ Changing content will re-embed the persona for situational matching. Categories 
     // BACKGROUND SERVICE — Optional dashboard server
     // ─────────────────────────────────────────────────────────────────────────
     const dashboardEnabled = pluginConfig?.dashboardEnabled;
-    if (dashboardEnabled) {
+    if (!_isOneShotCommand && dashboardEnabled) {
       import("./dashboard/server.js").then(({ startDashboard }) => {
         startDashboard({
           port: pluginConfig?.dashboardPort,
