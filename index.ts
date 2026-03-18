@@ -211,20 +211,6 @@ const openclawPostgresPlugin = {
     const llmModel = memoryConfig?.remote?.model || memoryConfig?.model || "text-embedding-nomic-embed-text-v2-moe";
     setEmbeddingConfig(llmUrl, llmModel);
 
-    const agentId = "main";
-    const workspaceDir = api.config?.workspaceDir;
-    ensureAgent(agentId, workspaceDir).then(() => {
-      loadConfig(agentId).then(() => {
-        console.log("[PostClaw] Configuration loaded successfully");
-        // Verify that the configured embedding model dimensions match the schema
-        import("./services/db.js").then(({ validateEmbeddingDimension }) => {
-          validateEmbeddingDimension(agentId).catch((err) => {
-             console.error("[PostClaw] Failed initial embedding validation check:", err);
-          });
-        });
-      });
-    });
-
     // -------------------------------------------------------------------------
     // before_prompt_build — Prune + replace system prompt, inject RAG context
     //
