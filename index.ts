@@ -31,7 +31,6 @@ export type { ChatMessage, ContentPart, ToolCallRecord } from "./schemas/validat
 // =============================================================================
 
 const processedEvents = new Set<string>();
-let _gatewayRegistered = false;
 
 import { getCurrentConfig, loadConfig } from "./services/config.js";
 
@@ -79,14 +78,6 @@ const openclawPostgresPlugin = {
   description: "PostgreSQL-backed RAG, memory, and persona management",
 
   register(api: any) {
-    // Detect when invoked as a one-shot CLI subcommand (e.g. `openclaw postclaw sleep`).
-    // In that case we only need the CLI command registrations below — hooks, tools,
-    // and background services are gateway-only and produce unwanted noise in CLI runs.
-    // The CLI action handlers apply their own targeted config before executing.
-    const _isCliMode = process.argv.some(a =>
-      ['setup', 'persona', 'sleep', 'dashboard'].includes(a)
-    );
-
     // -------------------------------------------------------------------------
     // CLI — Register `openclaw postclaw` subcommands
     //
@@ -199,20 +190,6 @@ const openclawPostgresPlugin = {
       },
       { commands: ["postclaw"] },
     );
-
-    // In CLI mode the subcommand action handles everything itself.
-    // Skip gateway-only setup: hooks, tools, and background services are not
-    // needed and their init logs would be unwanted noise in a CLI context.
-    if (_isCliMode) {
-      return;
-    }
-
-    // Guard against double registration when openclaw loads the plugin in
-    // multiple subsystem contexts within the same Node.js module cache.
-    if (_gatewayRegistered) {
-      return;
-    }
-    _gatewayRegistered = true;
 
     console.log("[PostClaw] Registering plugin hooks...");
 
