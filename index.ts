@@ -211,7 +211,15 @@ const openclawPostgresPlugin = {
     // In CLI mode the subcommand action handles everything itself.
     // Skip gateway-only setup: hooks, tools, and background services are not
     // needed and their init logs would be unwanted noise in a CLI context.
-    if (_isCliMode) {
+    //
+    // OpenClaw also loads plugins for diagnostic commands such as `status` and
+    // `doctor`. Those commands should not open PostClaw's DB pool. Runtime
+    // invocations (`gateway`, `agent`) still need hooks/tools so memory capture
+    // and RAG continue to work.
+    const _isGatewayMode = process.argv.some(a => a === "gateway");
+    const _isAgentRunMode = process.argv.some(a => a === "agent");
+    const _isRuntimeMode = _isGatewayMode || _isAgentRunMode;
+    if (_isCliMode || !_isRuntimeMode) {
       return;
     }
 
@@ -830,7 +838,7 @@ Changing content will re-embed the persona for situational matching. Categories 
     // BACKGROUND SERVICE — Start sleep cycle on an interval
     // ─────────────────────────────────────────────────────────────────────────
     const sleepIntervalHours = api.config?.plugins?.entries?.postclaw?.config?.sleepIntervalHours;
-    if (sleepIntervalHours !== 0) {
+    if (_isGatewayMode && sleepIntervalHours !== 0) {
       // Start the background sleep cycle service (0 = disabled)
       import("./scripts/sleep_cycle.js").then(({ startService }) => {
         const config = getCurrentConfig();
