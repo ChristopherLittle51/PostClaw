@@ -79,10 +79,13 @@ const openclawPostgresPlugin = {
   description: "PostgreSQL-backed RAG, memory, and persona management",
 
   register(api: any) {
-    if (_registered) {
+    const _toolDiscoveryMode = api?.registrationMode === "tool-discovery";
+    if (_registered && !_toolDiscoveryMode) {
       return;
     }
-    _registered = true;
+    if (!_toolDiscoveryMode) {
+      _registered = true;
+    }
 
     // Detect when invoked as a one-shot CLI subcommand (e.g. `openclaw postclaw sleep`).
     // In that case we only need the CLI command registrations below — hooks, tools,
